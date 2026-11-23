@@ -32,9 +32,6 @@ The current session is detected automatically.
 
 MARK_BEGIN = "<!-- agentloop:begin -->"
 MARK_END = "<!-- agentloop:end -->"
-GUIDANCE = (MARK_BEGIN + "\n## Lifecycle\n\n"
-            "Use `agentloop` to record lifecycle steps; it detects the current session automatically.\n"
-            + MARK_END + "\n")
 HOOK_TIMEOUT = 10
 MAX_TURNS = 64
 
@@ -637,13 +634,16 @@ def norm_blank(text):
     return "\n".join(l for l in (text or "").splitlines() if l.strip())
 
 
-def add_block(text):
+def add_block(text, body):
+    block = MARK_BEGIN + "\n" + body.rstrip() + "\n" + MARK_END
     if text and MARK_BEGIN in text:
-        return text
+        start = text.index(MARK_BEGIN)
+        end = text.index(MARK_END, start)
+        return text[:start] + block + text[end + len(MARK_END):]
     if not text:
-        return GUIDANCE
+        return block + "\n"
     sep = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
-    return text + sep + GUIDANCE
+    return text + sep + block + "\n"
 
 
 def remove_block(text):
@@ -663,8 +663,13 @@ def remove_block(text):
 def imports_agents(claude_md, env):
     for line in (claude_md or "").splitlines():
         s = line.strip()
-        if s.startswith("@") and s.endswith("AGENTS.md") and ".codex" in s:
-            return True
+        if s.startswith("@"):
+            target = s[1:]
+            if target.startswith("~/"):
+                target = os.path.join(home(env), target[2:])
+            target = os.path.join(claude_dir(env), target)
+            if os.path.realpath(target) == os.path.realpath(os.path.join(codex_dir(env), "AGENTS.md")):
+                return True
     return False
 
 
@@ -723,6 +728,26 @@ def install(env, python, source):
             tomllib.loads(toml)
         except Exception as e:
             raise UserError("agentloop: %s is not valid TOML (%s); nothing was changed" % (ct, e))
+    root = source or os.path.dirname(os.path.dirname(me))
+    lifecycle = read_text(os.path.join(root, "AGENTS.md"))
+    if not lifecycle or not lifecycle.strip():
+        raise UserError("agentloop: missing package AGENTS.md; run install.sh from the repository")
+    agents_md = os.path.join(codex_dir(env), "AGENTS.md")
+    claude_md = os.path.join(claude_dir(env), "CLAUDE.md")
+    guidance = lifecycle.replace("](skills/review-plan/SKILL.md)",
+                                 "](~/.agents/skills/review-plan/SKILL.md)")
+    guidance = guidance.rstrip() + "\n\nUse `agentloop` to record lifecycle steps; it detects the current session automatically."
+    cm = read_text(claude_md) or ""
+    for current in (read_text(agents_md) or "", cm):
+        if (current.count(MARK_BEGIN), current.count(MARK_END)) not in ((0, 0), (1, 1)) or current.find(MARK_BEGIN) > current.find(MARK_END):
+            raise UserError("agentloop: malformed guidance markers; nothing was changed")
+    agents_text = add_block(read_text(agents_md), guidance)
+    if imports_agents(remove_block(cm), env):
+        claude_text = remove_block(cm)
+    else:
+        target = os.path.relpath(agents_md, claude_dir(env))
+        claude_text = add_block(cm, "@" + target)
+
     ch_ = Changes(env)
 
     # 1. binary
@@ -756,13 +781,8 @@ def install(env, python, source):
         ch_.manifest.setdefault("toml_features_before", toml_features_line(toml))
         ch_.write(ct, new_toml, "set features.hooks = true in " + ct)
 
-    # 4. guidance
-    agents_md = os.path.join(codex_dir(env), "AGENTS.md")
-    ch_.write(agents_md, add_block(read_text(agents_md)), "added guidance to " + agents_md)
-    claude_md = os.path.join(claude_dir(env), "CLAUDE.md")
-    cm = read_text(claude_md)
-    if not imports_agents(cm, env):
-        ch_.write(claude_md, add_block(cm), "added guidance to " + claude_md)
+    ch_.write(agents_md, agents_text, "updated guidance in " + agents_md)
+    ch_.write(claude_md, claude_text, "updated guidance in " + claude_md)
 
     # 5. skills
     if source and os.path.isdir(os.path.join(source, "skills")):

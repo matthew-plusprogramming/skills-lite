@@ -20,7 +20,7 @@ The installer works user-wide, for Claude Code and Codex:
 
 - Installs the `agentloop` CLI to `~/.local/bin/agentloop`.
 - Adds one `Stop` hook to `~/.claude/settings.json` and one to `~/.codex/hooks.json`, and sets `features.hooks = true` in `~/.codex/config.toml`. Hooks are enabled on install.
-- Adds a short marked block to `~/.codex/AGENTS.md` (and to `~/.claude/CLAUDE.md` unless it already imports that file): use `agentloop` to record lifecycle steps; it detects the current session automatically.
+- Installs the full work loop from the repository’s `AGENTS.md` into a marked section of `~/.codex/AGENTS.md`. Claude imports that file from `~/.claude/CLAUDE.md`. Re-running the installer upgrades the previous reminder and preserves personal instructions outside the marked section.
 - Copies `skills/` into `~/.agents/skills`, backing up any file that differs, and links each skill into `~/.claude/skills` where no entry exists yet.
 
 Lifecycle state is kept per session under `~/.local/state/agentloop`. The installer never changes sandbox or approval settings. In a sandboxed agent shell (for example Codex `workspace-write`) that folder may not be writable, so `agentloop` commands need your agent's approval to run outside the sandbox.

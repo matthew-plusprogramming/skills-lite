@@ -363,6 +363,24 @@ class InstallTest(Base):
             self.assertFalse(os.path.exists(os.path.join(self.home, rel)), rel)
         self.assertFalse(os.path.lexists(os.path.join(self.home, ".claude", "skills", "review-plan")))
 
+    def test_upgrade_old_guidance_preserves_notes_and_imports_full_loop(self):
+        old = al.MARK_BEGIN + "\n## Lifecycle\nOld reminder\n" + al.MARK_END + "\n"
+        for path in (".codex/AGENTS.md", ".claude/CLAUDE.md"):
+            self.write(path, "Personal notes\n\n" + old + "More notes\n")
+        for _ in range(2):
+            code, _, err = self.install()
+            self.assertEqual(code, 0, err)
+            agents = self.read(".codex/AGENTS.md")
+            claude = self.read(".claude/CLAUDE.md")
+            for content in (agents, claude):
+                self.assertTrue(content.startswith("Personal notes\n\n"))
+                self.assertTrue(content.endswith("More notes\n"))
+                self.assertEqual(content.count(al.MARK_BEGIN), 1)
+                self.assertNotIn("Old reminder", content)
+            self.assertIn("wait for my explicit approval", agents)
+            self.assertIn("Have a separate verifier", agents)
+            self.assertIn("@../.codex/AGENTS.md\n", claude)
+
     def test_invalid_json_aborts_without_writes(self):
         self.write(".claude/settings.json", "{not json")
         before = tree_digest(self.home)
