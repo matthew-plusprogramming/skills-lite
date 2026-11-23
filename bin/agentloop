@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""agentloop: record AGENTS.md work-loop steps, guard Stop in Claude Code and Codex.
+
+One file serves as the CLI, the Stop hook (`agentloop hook claude|codex`) and the
+installer (`agentloop install` / `agentloop uninstall`). Python 3.8+, stdlib only.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
+
+USAGE = """usage: agentloop <command>
+  plan <link>           plan published; next: independent review
+  reviewed              review addressed; now wait for approval
+  approved              human explicitly approved; start work
+  verified <evidence>   separate verifier accepted the result
+  wait [why]            ending this turn to wait for the human
+  exempt [why]          leave the loop: one-off ask or mistaken nudge
+  status                show phase, next step and hook health
+The current session is detected automatically.
+"""
+
+MARK_BEGIN = "<!-- agentloop:begin -->"
+MARK_END = "<!-- agentloop:end -->"
+GUIDANCE = (MARK_BEGIN + "\n## Lifecycle\n\n"
+            "Use `agentloop` to record lifecycle steps; it detects the current session automatically.\n"
+            + MARK_END + "\n")
+HOOK_TIMEOUT = 10
+MAX_TURNS = 64
+
+NEXT = {
+    None: "record the current step: `agentloop plan <link>`, or `agentloop exempt` for a one-off",
+    "review": "get an independent read-only review, send the revised plan, then `agentloop reviewed`",
+    "approval": "wait for the human's explicit approval, then `agentloop approved`",
+    "work": "collect evidence, have a separate verifier judge it, then `agentloop verified <evidence>`",
+    "done": "loop complete; the next task starts fresh",
+    "exempt": "exempt; the next task starts fresh",
+}
+
+REASONS = {
+    None: ("agentloop: no lifecycle step is recorded for this task. Follow the AGENTS.md work loop "
+           "and record the current step with `agentloop` (run `agentloop` for usage). For a one-off "
+           "or a mistaken nudge, run `agentloop exempt`. If you are waiting for the human, run "
+           "`agentloop wait`."),
+    "review": ("agentloop: the plan is recorded but not reviewed. Have an independent read-only "
+               "reviewer review it, address the findings, send the revised plan to the human, then "
+               "run `agentloop reviewed`. If you are waiting for the human, run `agentloop wait`."),
+    "work": ("agentloop: work is in progress but not verified. Collect evidence, have a separate "
+             "verifier judge it against the plan, then run `agentloop verified \"<evidence>\"`. If "
+             "you need the human, run `agentloop wait`; for a one-off, `agentloop exempt`."),
+}
+
+
+class UserError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- paths
+
+def home(env):
+    return env.get("HOME") or os.path.expanduser("~")
+
+
+def state_dir(env):
+    base = env.get("XDG_STATE_HOME") or os.path.join(home(env), ".local", "state")
+    return os.path.join(base, "agentloop")
+
+
+def claude_dir(env):
+    return env.get("CLAUDE_CONFIG_DIR") or os.path.join(home(env), ".claude")
+
+
+def codex_dir(env):
+    return env.get("CODEX_HOME") or os.path.join(home(env), ".codex")
+
+
+def bin_path(env):
+    return os.path.join(home(env), ".local", "bin", "agentloop")
+
+
+def atomic_write(path, data):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".agentloop-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        if os.path.exists(path):
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def log(env, **rec):
+    try:
+        rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        d = state_dir(env)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- session state
+
+class Session:
+    def __init__(self, env, agent, sid):
+        if not sid or "/" in sid or sid.startswith("."):
+            raise UserError("agentloop: invalid session id")
+        self.path = os.path.join(state_dir(env), "sessions", "%s-%s.json" % (agent, sid))
+        self.agent, self.sid = agent, sid
+        self.lockf = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if fcntl:
+            self.lockf = open(self.path + ".lock", "w")
+            fcntl.flock(self.lockf, fcntl.LOCK_EX)
+        text = read_text(self.path)
+        self.exists = text is not None
+        self.data = json.loads(text) if text else {}
+        self.data.setdefault("phase", None)
+        self.data.setdefault("turns", {})
+        return self
+
+    def save(self):
+        turns = self.data["turns"]
+        while len(turns) > MAX_TURNS:
+            turns.pop(next(iter(turns)))
+        self.data["agent"], self.data["session"] = self.agent, self.sid
+        self.data["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        atomic_write(self.path, json.dumps(self.data, indent=1) + "\n")
+
+    def __exit__(self, *exc):
+        if self.lockf:
+            self.lockf.close()
+
+
+# ---------------------------------------------------------------- process tree
+
+def _darwin_proc(pid):
+    """(ppid, name) via sysctl KERN_PROC_PID: no exec, so it works inside the Codex sandbox."""
+    import ctypes
+    libc = ctypes.CDLL(None)
+    buf = ctypes.create_string_buffer(1024)
+    size = ctypes.c_size_t(len(buf))
+    mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+    if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value < 564:
+        return None
+    raw = buf.raw[:size.value]
+    # struct kinfo_proc (64-bit): kp_proc.p_comm at 243, kp_eproc.e_ppid at 560
+    name = raw[243:260].split(b"\0")[0].decode("utf-8", "replace")
+    return int.from_bytes(raw[560:564], sys.byteorder), name
+
+
+def _darwin_argv(pid):
+    """Exact argv via sysctl KERN_PROCARGS2 (keeps arguments that contain spaces intact)."""
+    import ctypes
+    libc = ctypes.CDLL(None)
+    size = ctypes.c_size_t(0)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or not size.value:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buf.raw[:size.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    rest = raw[4:]
+    rest = rest[rest.index(b"\0"):].lstrip(b"\0")  # skip exec path and padding
+    return [a.decode("utf-8", "replace") for a in rest.split(b"\0")[:argc]]
+
+
+def _ps(pid, field):
+    out = subprocess.run(["ps", "-o", field + "=", "-p", str(pid)], capture_output=True,
+                         text=True, timeout=5).stdout.strip()
+    return out or None
+
+
+def proc_info(pid, want_args=False):
+    """Return (ppid, name, args) for pid, or None. args is [] unless want_args."""
+    if os.path.isdir("/proc/%d" % pid):
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                stat = f.read()
+            ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+            name = stat[stat.index("(") + 1:stat.rindex(")")]
+            try:
+                name = os.path.basename(os.readlink("/proc/%d/exe" % pid))
+            except OSError:
+                pass
+            args = []
+            if want_args:
+                with open("/proc/%d/cmdline" % pid, "rb") as f:
+                    args = [x.decode("utf-8", "replace") for x in f.read().split(b"\0") if x]
+            return ppid, name, args
+        except (OSError, ValueError, IndexError):
+            return None
+    info = None
+    if sys.platform == "darwin":
+        try:
+            info = _darwin_proc(pid)
+        except Exception:
+            info = None
+    args = []
+    try:
+        if info is None:
+            out = _ps(pid, "ppid")
+            name = _ps(pid, "comm")
+            if not out or name is None:
+                return None
+            info = (int(out), name)
+        if want_args:
+            argv = None
+            if sys.platform == "darwin":
+                try:
+                    argv = _darwin_argv(pid)
+                except Exception:
+                    argv = None
+            args = argv if argv is not None else (_ps(pid, "args") or "").split()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if info is None:
+            return None
+    return info[0], info[1], args
+
+
+def ancestors(start, want_args=False):
+    pid, seen = start, set()
+    while pid and pid > 1 and pid not in seen and len(seen) < 64:
+        seen.add(pid)
+        info = proc_info(pid, want_args)
+        if not info:
+            return
+        ppid, name, args = info
+        yield pid, name, args
+        pid = ppid
+
+
+def nearest_agent(env, start=None, want_args=False):
+    """Return (agent, pid, args) for the nearest Claude or Codex ancestor."""
+    claude_pid = env.get("CLAUDE_PID", "")
+    for pid, name, args in ancestors(start or os.getppid(), want_args):
+        base = os.path.basename(name)
+        if claude_pid and str(pid) == claude_pid:
+            return "claude", pid, args
+        if base == "codex":
+            return "codex", pid, args
+    return None
+
+
+def current_session(env, start=None):
+    found = nearest_agent(env, start)
+    if not found:
+        raise UserError("agentloop: no calling Claude Code or Codex session found "
+                        "(run it from an agent's shell)")
+    agent = found[0]
+    sid = env.get("CLAUDE_CODE_SESSION_ID" if agent == "claude" else "CODEX_THREAD_ID")
+    if not sid:
+        raise UserError("agentloop: %s session id is not set in this shell" % agent)
+    return agent, sid
+
+
+def is_headless(agent, env, start=None):
+    found = nearest_agent(env, start, want_args=True)
+    args = found[2][1:] if found and found[0] == agent else []
+    if agent == "claude":
+        ep = env.get("CLAUDE_CODE_ENTRYPOINT", "")
+        return ep.startswith("sdk") or "-p" in args or "--print" in args
+    return codex_subcommand(args) in ("exec", "e", "review")
+
+
+CODEX_VALUE_FLAGS = {"-c", "--config", "-i", "--image", "-m", "--model", "-p", "--profile",
+                     "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd", "--enable",
+                     "--disable", "--add-dir", "--local-provider", "--remote",
+                     "--remote-auth-token-env"}
+
+
+def codex_subcommand(args):
+    """First positional argument after codex's global options (None if there is none)."""
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in CODEX_VALUE_FLAGS:
+            skip = True
+        elif not a.startswith("-"):
+            return a
+    return None
+
+
+# ---------------------------------------------------------------- CLI commands
+
+def cmd_record(env, session, cmd, rest):
+    agent, sid = session
+    if cmd == "plan" and not rest:
+        raise UserError("usage: agentloop plan <link>")
+    if cmd == "verified" and not rest:
+        raise UserError("usage: agentloop verified <evidence>")
+    note = " ".join(rest)
+    with Session(env, agent, sid) as s:
+        d = s.data
+        if cmd == "wait":
+            d["wait"] = True
+        else:
+            d["phase"] = {"plan": "review", "reviewed": "approval", "approved": "work",
+                          "verified": "done", "exempt": "exempt"}[cmd]
+            d["wait"] = False
+            d["finish_turn"] = None
+            if cmd == "plan":
+                d["plan"] = note
+        d.setdefault("history", []).append([time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                            cmd, note])
+        d["history"] = d["history"][-50:]
+        s.save()
+        phase = d["phase"]
+    msg = "agentloop: recorded %s (%s session)." % (cmd, agent)
+    if cmd == "wait":
+        msg += " The next Stop yields; phase stays %s." % (phase or "unset")
+    else:
+        msg += " Next: %s." % NEXT[phase]
+    print(msg)
+    if cmd == "plan":
+        for w in health(env)[agent]:
+            print("agentloop warning: " + w)
+
+
+def cmd_status(env, session):
+    agent, sid = session
+    path = Session(env, agent, sid).path
+    text = read_text(path)
+    d = json.loads(text) if text else {}
+    phase = d.get("phase")
+    print("session: %s %s" % (agent, sid))
+    print("phase:   %s%s" % (phase or "none", " (wait pass pending)" if d.get("wait") else ""))
+    if d.get("plan"):
+        print("plan:    %s" % d["plan"])
+    print("next:    %s" % NEXT[phase])
+    problems = health(env)
+    for a in ("claude", "codex"):
+        print("hook %-6s %s" % (a + ":", "; ".join(problems[a]) or "ok"))
+
+
+def health(env):
+    out = {"claude": [], "codex": []}
+    s = load_json(os.path.join(claude_dir(env), "settings.json"), quiet=True)
+    if not s or not find_hook(s, "claude"):
+        out["claude"].append("Stop hook not configured (run install.sh)")
+    h = load_json(os.path.join(codex_dir(env), "hooks.json"), quiet=True)
+    idx = find_hook(h or {}, "codex")
+    if not idx:
+        out["codex"].append("Stop hook not configured (run install.sh)")
+    else:
+        toml = read_text(os.path.join(codex_dir(env), "config.toml")) or ""
+        if not toml_features_hooks(toml):
+            out["codex"].append("features.hooks is not true in config.toml")
+        if trust_key(env, idx[0]) not in toml:
+            out["codex"].append("hook not trusted yet: open codex and choose 'Trust all and continue'")
+    if not os.path.exists(bin_path(env)):
+        for a in out:
+            out[a].append("binary missing at " + bin_path(env))
+    errs = recent_errors(env)
+    if errs:
+        for a in out:
+            out[a].append("%d hook error(s) in the last day (see %s)" % (
+                errs, os.path.join(state_dir(env), "log")))
+    return out
+
+
+def recent_errors(env):
+    text = read_text(os.path.join(state_dir(env), "log")) or ""
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+    n = 0
+    for line in text.splitlines()[-500:]:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("error") and rec.get("ts", "") >= cutoff:
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------- Stop hook
+
+def turn_key(payload):
+    for k in ("prompt_id", "turn_id"):
+        v = payload.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def decide(env, agent, payload, start=None):
+    """Return (block_reason_or_None, why) and update state."""
+    if env.get("AGENTLOOP", "").lower() == "off":
+        return None, "disabled"
+    if is_headless(agent, env, start):
+        return None, "headless"
+    sid = payload.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        raise ValueError("payload has no session_id")
+    turn = turn_key(payload)
+    if not turn:
+        log(env, agent=agent, session=sid, error="payload has no prompt_id/turn_id")
+        return None, "no-turn-id"
+    with Session(env, agent, sid) as s:
+        d = s.data
+        turns = d["turns"]
+        if d["phase"] in ("done", "exempt"):
+            if not d.get("finish_turn"):
+                d["finish_turn"] = turn
+                turns[turn] = "allow"
+                s.save()
+                return None, "finish"
+            if turn == d["finish_turn"] or turn in turns:
+                return None, "finish-repeat"
+            d["phase"], d["finish_turn"], d["wait"] = None, None, False
+            d.pop("plan", None)
+        if turn in turns or payload.get("stop_hook_active") is True:
+            if turn not in turns:
+                turns[turn] = "allow"
+                s.save()
+            return None, "repeat"
+        decision, why = None, "allowed"
+        if d.get("wait"):
+            d["wait"], why = False, "wait"
+        elif payload.get("background_tasks"):
+            why = "background"
+        elif d["phase"] == "approval":
+            why = "approval"
+        else:
+            decision, why = REASONS[d["phase"]], "remind-%s" % (d["phase"] or "none")
+        turns[turn] = "block" if decision else "allow"
+        s.save()
+        return decision, why
+
+
+def cmd_hook(env, agent, stdin_text, start=None):
+    if agent not in ("claude", "codex"):
+        return ""
+    try:
+        payload = json.loads(stdin_text or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("payload is not an object")
+        if payload.get("hook_event_name") not in (None, "Stop"):
+            return ""
+        reason, why = decide(env, agent, payload, start)
+        log(env, agent=agent, session=payload.get("session_id"), turn=turn_key(payload),
+            cwd=payload.get("cwd"), decision="block" if reason else "allow", why=why)
+        if reason:
+            return json.dumps({"decision": "block", "reason": reason})
+        return ""
+    except Exception as e:  # fail open
+        log(env, agent=agent, error="%s: %s" % (type(e).__name__, e))
+        return ""
+
+
+# ---------------------------------------------------------------- installer helpers
+
+def hook_command(env, agent):
+    return '"%s" hook %s' % (bin_path(env), agent)
+
+
+def load_json(path, quiet=False):
+    text = read_text(path)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError as e:
+        if quiet:
+            return None
+        raise UserError("agentloop: %s is not valid JSON (%s); nothing was changed" % (path, e))
+    if not isinstance(data, dict):
+        if quiet:
+            return None
+        raise UserError("agentloop: %s is not a JSON object; nothing was changed" % path)
+    return data
+
+
+def is_ours(handler, agent):
+    cmd = str((handler or {}).get("command", "")) if isinstance(handler, dict) else ""
+    return re.search(r'agentloop["\']?\s+hook\s+%s\b' % agent, cmd) is not None
+
+
+def find_hook(data, agent):
+    """Return (group_index, handler_index) of our Stop handler for agent, or None."""
+    groups = (data.get("hooks") or {}).get("Stop") or []
+    for gi, g in enumerate(groups):
+        for hi, h in enumerate((g or {}).get("hooks") or []):
+            if is_ours(h, agent):
+                return gi, hi
+    return None
+
+
+def add_hook(data, env, agent):
+    if find_hook(data, agent):
+        return False
+    hooks = data.setdefault("hooks", {})
+    hooks.setdefault("Stop", []).append(
+        {"hooks": [{"type": "command", "command": hook_command(env, agent), "timeout": HOOK_TIMEOUT}]})
+    return True
+
+
+def remove_hook(data, agent):
+    hooks = data.get("hooks") or {}
+    groups = hooks.get("Stop") or []
+    kept = []
+    for g in groups:
+        hs = [h for h in (g or {}).get("hooks") or [] if not is_ours(h, agent)]
+        if hs:
+            g["hooks"] = hs
+            kept.append(g)
+        elif not (g or {}).get("hooks") and g:
+            kept.append(g)
+    if kept:
+        hooks["Stop"] = kept
+    else:
+        hooks.pop("Stop", None)
+    if "hooks" in data and not hooks:
+        data.pop("hooks")
+
+
+def dump_json(data):
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def toml_features_hooks(text):
+    section = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            section = s
+        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
+            return s.split("=", 1)[1].split("#")[0].strip() == "true"
+    return False
+
+
+def toml_set_features_hooks(text):
+    """Return text with features.hooks = true (unchanged if already true)."""
+    if toml_features_hooks(text):
+        return text
+    lines = text.splitlines(True)
+    section, header_at = None, None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("["):
+            section = s
+            if s == "[features]":
+                header_at = i
+        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
+            lines[i] = "hooks = true\n"
+            return "".join(lines)
+    if header_at is not None:
+        lines.insert(header_at + 1, "hooks = true\n")
+        return "".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + ("\n" if text else "") + "[features]\nhooks = true\n"
+
+
+def toml_features_line(text):
+    """Describe features.hooks before install: the exact line, 'no-key' or 'no-table'."""
+    section, has_table = None, False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            section = s
+            has_table = has_table or s == "[features]"
+        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
+            return line
+    return "no-key" if has_table else "no-table"
+
+
+def toml_restore_features(text, before):
+    lines = text.splitlines(True)
+    section = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("["):
+            section = s
+        elif section == "[features]" and s == "hooks = true":
+            if before not in ("no-key", "no-table"):
+                lines[i] = before + "\n"
+                return "".join(lines)
+            del lines[i]
+            out = "".join(lines)
+            if before == "no-table":
+                out = out.replace("\n\n[features]\n", "\n", 1) if "\n\n[features]\n" in out \
+                    else out.replace("[features]\n", "", 1)
+            return out
+    return text
+
+
+def trust_key(env, group_index):
+    path = os.path.join(codex_dir(env), "hooks.json")
+    return '[hooks.state."%s:stop:%d:0"]' % (path, group_index)
+
+
+def toml_remove_table(text, header):
+    lines = text.splitlines(True)
+    out, skipping = [], False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("["):
+            skipping = (s == header)
+            if skipping and out and not out[-1].strip():
+                out.pop()  # the blank line Codex writes before each table
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def norm_blank(text):
+    return "\n".join(l for l in (text or "").splitlines() if l.strip())
+
+
+def add_block(text):
+    if text and MARK_BEGIN in text:
+        return text
+    if not text:
+        return GUIDANCE
+    sep = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    return text + sep + GUIDANCE
+
+
+def remove_block(text):
+    if not text or MARK_BEGIN not in text:
+        return text
+    a = text.index(MARK_BEGIN)
+    b = text.find(MARK_END, a)
+    b = len(text) if b < 0 else b + len(MARK_END)
+    if text[b:b + 1] == "\n":
+        b += 1
+    head = text[:a]
+    if head.endswith("\n\n"):
+        head = head[:-1]
+    return head + text[b:]
+
+
+def imports_agents(claude_md, env):
+    for line in (claude_md or "").splitlines():
+        s = line.strip()
+        if s.startswith("@") and s.endswith("AGENTS.md") and ".codex" in s:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- install / uninstall
+
+class Changes:
+    """Track file edits with backups and a manifest for uninstall."""
+
+    def __init__(self, env):
+        self.env = env
+        self.mpath = os.path.join(state_dir(env), "install.json")
+        self.manifest = json.loads(read_text(self.mpath) or "{}")
+        self.manifest.setdefault("originals", {})
+        self.manifest.setdefault("created", [])
+        self.stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+        self.log = []
+
+    def write(self, path, new, label):
+        old = read_text(path)
+        if old == new:
+            return
+        orig_dir = os.path.join(state_dir(self.env), "originals")
+        if path not in self.manifest["originals"]:
+            if old is None:
+                self.manifest["originals"][path] = None
+            else:
+                os.makedirs(orig_dir, exist_ok=True)
+                keep = os.path.join(orig_dir, hashlib.sha1(path.encode()).hexdigest()[:12])
+                shutil.copy2(path, keep)
+                self.manifest["originals"][path] = keep
+        if old is not None:
+            shutil.copy2(path, "%s.agentloop-bak-%s" % (path, self.stamp))
+        atomic_write(path, new)
+        self.log.append(label)
+
+    def save(self):
+        atomic_write(self.mpath, json.dumps(self.manifest, indent=1) + "\n")
+
+
+def install(env, python, source):
+    me = os.path.abspath(__file__)
+    prepared = {}
+    # Read and validate everything first so a bad file aborts before any write.
+    cs = os.path.join(claude_dir(env), "settings.json")
+    ch = os.path.join(codex_dir(env), "hooks.json")
+    ct = os.path.join(codex_dir(env), "config.toml")
+    for path in (cs, ch):
+        prepared[path] = load_json(path) or {}
+    toml = read_text(ct) or ""
+    try:
+        import tomllib
+    except ImportError:  # Python < 3.11: no stdlib TOML parser; edits stay line-based
+        tomllib = None
+    if tomllib and toml:
+        try:
+            tomllib.loads(toml)
+        except Exception as e:
+            raise UserError("agentloop: %s is not valid TOML (%s); nothing was changed" % (ct, e))
+    ch_ = Changes(env)
+
+    # 1. binary
+    with open(me, encoding="utf-8") as f:
+        body = f.read()
+    lines = body.split("\n", 1)
+    if lines[0].startswith("#!"):
+        body = lines[1] if len(lines) > 1 else ""
+    shebang = "#!%s\n" % (python or sys.executable)
+    dest = bin_path(env)
+    new_bin = shebang + body
+    if read_text(dest) != new_bin:
+        if os.path.exists(dest) and os.path.realpath(dest) != os.path.realpath(me):
+            if "agentloop" not in (read_text(dest) or "")[:400]:
+                raise UserError("agentloop: %s exists and is not agentloop; nothing was changed" % dest)
+        if not os.path.exists(dest) and dest not in ch_.manifest["created"]:
+            ch_.manifest["created"].append(dest)
+        atomic_write(dest, new_bin)
+        ch_.log.append("installed " + dest)
+    os.chmod(dest, 0o755)
+
+    # 2. hooks
+    for path, agent in ((cs, "claude"), (ch, "codex")):
+        data = prepared[path]
+        if add_hook(data, env, agent):
+            ch_.write(path, dump_json(data), "added %s Stop hook to %s" % (agent, path))
+
+    # 3. Codex feature flag (remember the old value so uninstall can restore it)
+    new_toml = toml_set_features_hooks(toml)
+    if new_toml != toml:
+        ch_.manifest.setdefault("toml_features_before", toml_features_line(toml))
+        ch_.write(ct, new_toml, "set features.hooks = true in " + ct)
+
+    # 4. guidance
+    agents_md = os.path.join(codex_dir(env), "AGENTS.md")
+    ch_.write(agents_md, add_block(read_text(agents_md)), "added guidance to " + agents_md)
+    claude_md = os.path.join(claude_dir(env), "CLAUDE.md")
+    cm = read_text(claude_md)
+    if not imports_agents(cm, env):
+        ch_.write(claude_md, add_block(cm), "added guidance to " + claude_md)
+
+    # 5. skills
+    if source and os.path.isdir(os.path.join(source, "skills")):
+        install_skills(env, os.path.join(source, "skills"), ch_)
+
+    ch_.save()
+    for line in ch_.log or ["already installed; nothing changed"]:
+        print("agentloop: " + line)
+    bindir = os.path.dirname(dest)
+    if bindir not in env.get("PATH", "").split(os.pathsep):
+        shell = os.path.basename(env.get("SHELL", "sh"))
+        rc = {"zsh": "~/.zshrc", "bash": "~/.bashrc"}.get(shell, "~/.profile")
+        print("agentloop: %s is not on PATH. Add this line to %s:" % (bindir, rc))
+        print('  export PATH="$HOME/.local/bin:$PATH"')
+    if not health(env)["codex"] == []:
+        print("agentloop: Codex: open `codex` once (in an empty folder) and choose "
+              "'Trust all and continue' to enable its Stop hook.")
+
+
+def install_skills(env, src_root, ch_):
+    agents_skills = os.path.join(home(env), ".agents", "skills")
+    claude_skills = os.path.join(claude_dir(env), "skills")
+    for name in sorted(os.listdir(src_root)):
+        src = os.path.join(src_root, name)
+        if not os.path.isdir(src):
+            continue
+        dst = os.path.join(agents_skills, name)
+        for root, _, files in os.walk(src):
+            for fn in files:
+                s = os.path.join(root, fn)
+                t = os.path.join(dst, os.path.relpath(s, src))
+                new = read_text(s)
+                old = read_text(t)
+                if old == new:
+                    continue
+                if old is None:
+                    ch_.manifest["created"].append(t)
+                    ch_.manifest.setdefault("hashes", {})[t] = hashlib.sha256(
+                        new.encode("utf-8")).hexdigest()
+                else:
+                    shutil.copy2(t, "%s.agentloop-bak-%s" % (t, ch_.stamp))
+                os.makedirs(os.path.dirname(t), exist_ok=True)
+                shutil.copy2(s, t)
+                ch_.log.append("installed skill file " + t)
+        link = os.path.join(claude_skills, name)
+        if os.path.lexists(link):
+            if not (os.path.islink(link) and os.path.realpath(link) == os.path.realpath(dst)):
+                ch_.log.append("left existing %s unchanged" % link)
+            continue
+        os.makedirs(claude_skills, exist_ok=True)
+        os.symlink(dst, link)
+        ch_.manifest["created"].append(link)
+        ch_.log.append("linked %s -> %s" % (link, dst))
+
+
+def uninstall(env):
+    ch_ = Changes(env)
+    m = ch_.manifest
+    cs = os.path.join(claude_dir(env), "settings.json")
+    ch = os.path.join(codex_dir(env), "hooks.json")
+    ct = os.path.join(codex_dir(env), "config.toml")
+    done = []
+    codex_idx = find_hook(load_json(ch, quiet=True) or {}, "codex")
+
+    def finish(path, new):
+        """Write new content, restoring the original bytes when nothing else changed."""
+        orig = m["originals"].get(path, "missing")
+        if orig is None and not norm_blank(new).strip("{} \n"):
+            if os.path.exists(path):
+                os.unlink(path)
+                done.append("removed " + path)
+            return
+        if orig not in (None, "missing"):
+            orig_text = read_text(orig)
+            same = (orig_text is not None and
+                    (norm_blank(orig_text) == norm_blank(new) or
+                     (path.endswith(".json") and json.loads(orig_text or "{}") == json.loads(new or "{}"))))
+            if same:
+                new = orig_text
+        if read_text(path) != new:
+            atomic_write(path, new)
+            done.append("restored " + path)
+
+    for path, agent in ((cs, "claude"), (ch, "codex")):
+        data = load_json(path, quiet=True)
+        if data is not None and find_hook(data, agent):
+            remove_hook(data, agent)
+            finish(path, dump_json(data) if data else "{}\n")
+    toml = read_text(ct)
+    if toml is not None:
+        new = toml
+        if codex_idx:
+            new = toml_remove_table(new, trust_key(env, codex_idx[0]))
+        before = m.get("toml_features_before", "unchanged")
+        if before != "unchanged":
+            new = toml_restore_features(new, before)
+        if new != toml:
+            finish(ct, new)
+    for path in (os.path.join(codex_dir(env), "AGENTS.md"), os.path.join(claude_dir(env), "CLAUDE.md")):
+        text = read_text(path)
+        if text and MARK_BEGIN in text:
+            finish(path, remove_block(text))
+    for path in reversed(m["created"]):
+        want = m.get("hashes", {}).get(path)
+        if want and os.path.isfile(path) and not os.path.islink(path):
+            if hashlib.sha256((read_text(path) or "").encode("utf-8")).hexdigest() != want:
+                done.append("kept edited " + path)
+                continue
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+            done.append("removed " + path)
+    if os.path.exists(bin_path(env)):
+        os.unlink(bin_path(env))
+        done.append("removed " + bin_path(env))
+    if os.path.exists(ch_.mpath):
+        os.unlink(ch_.mpath)
+    shutil.rmtree(os.path.join(state_dir(env), "originals"), ignore_errors=True)
+    for line in done or ["nothing to remove"]:
+        print("agentloop: " + line)
+
+
+# ---------------------------------------------------------------- entry point
+
+def main(argv, env=None, session=None, stdin=None, start=None):
+    env = dict(os.environ) if env is None else env
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "hook":
+            out = cmd_hook(env, rest[0] if rest else "", (stdin or sys.stdin).read(), start)
+            if out:
+                print(out)
+            return 0
+        if cmd == "install":
+            python = source = None
+            while rest:
+                flag = rest.pop(0)
+                if flag == "--python" and rest:
+                    python = rest.pop(0)
+                elif flag == "--source" and rest:
+                    source = rest.pop(0)
+            install(env, python, source)
+            return 0
+        if cmd == "uninstall":
+            uninstall(env)
+            return 0
+        if cmd in ("plan", "reviewed", "approved", "verified", "wait", "exempt", "status"):
+            session = session or current_session(env, start)
+            if cmd == "status":
+                cmd_status(env, session)
+            else:
+                cmd_record(env, session, cmd, rest)
+            return 0
+        sys.stderr.write("agentloop: unknown command %r\n%s" % (cmd, USAGE))
+        return 2
+    except UserError as e:
+        sys.stderr.write("%s\n" % e)
+        return 2
+    except OSError as e:
+        sys.stderr.write("agentloop: cannot write lifecycle state in %s (%s). A sandboxed agent "
+                         "shell may not allow writes there; rerun the command with your agent's "
+                         "approval to run outside the sandbox.\n" % (state_dir(env), e))
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
