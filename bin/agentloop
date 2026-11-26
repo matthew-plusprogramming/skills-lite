@@ -255,10 +255,20 @@ def ancestors(start, want_args=False):
         pid = ppid
 
 
+def test_tree(env):
+    """Test seam: AGENTLOOP_TEST_PROCTREE='[[pid, name, [args]], ...]' replaces the real
+    process tree, nearest first, so black-box tests can describe nested and headless runs."""
+    raw = env.get("AGENTLOOP_TEST_PROCTREE")
+    if not raw:
+        return None
+    return [(int(p), str(n), [str(a) for a in args]) for p, n, args in json.loads(raw)]
+
+
 def nearest_agent(env, start=None, want_args=False):
     """Return (agent, pid, args) for the nearest Claude or Codex ancestor."""
     claude_pid = env.get("CLAUDE_PID", "")
-    for pid, name, args in ancestors(start or os.getppid(), want_args):
+    tree = test_tree(env)
+    for pid, name, args in (tree if tree is not None else ancestors(start or os.getppid(), want_args)):
         base = os.path.basename(name)
         if claude_pid and str(pid) == claude_pid:
             return "claude", pid, args
