@@ -1,0 +1,16 @@
+# Low-noise defect checks (warn mode first). Pin the rule list explicitly: since Ruff 0.16
+# the default set is ~400 rules, and preview mode changes it again. Run with:
+#   uvx ruff@0.17.6 check --exit-zero --statistics
+target-version = "py38"
+extend-include = ["bin/agentloop"]   # extensionless script; Ruff skips it otherwise
+
+[lint]
+select = [
+  "F",                               # pyflakes: unused/undefined names, duplicate keys
+  "E711", "E722",                    # == None, bare except
+  "B006", "B008", "B018", "B904",    # mutable default, call in default, useless expression, raise without from
+  "T10",                             # debugger left in
+  "RUF006", "RUF100",                # dangling asyncio task, unused noqa
+]
+# Not selected yet: whole "B" (B023 was 5/5 false in a trial), "BLE001"/"S110" (agentloop's
+# fail-open catches are deliberate), "T20" (print is the CLI's output), "ERA001" (heuristic).
