@@ -6,11 +6,10 @@ import shutil
 import sys
 import time
 
-from agentloop.common import (MARK_BEGIN, MARK_END, HOOK_TIMEOUT, UserError, atomic_write,
-                              bin_path, claude_dir, codex_dir, find_hook, hook_command, home,
-                              is_ours, lib_dir, load_json, read_text, state_dir, toml_features_hooks,
-                              trust_key)
-from agentloop.runtime import VERSION, health
+from agentloop import (HOOK_TIMEOUT, MARK_BEGIN, MARK_END, VERSION, UserError, atomic_write,
+                       bin_path, claude_dir, codex_dir, find_hook, health, hook_command, home,
+                       is_ours, lib_dir, load_json, read_text, state_dir, toml_features_hooks,
+                       trust_key)
 
 
 def add_hook(data, env, agent):
@@ -192,7 +191,7 @@ class Changes:
         atomic_write(self.mpath, json.dumps(self.manifest, indent=1) + "\n")
 
 
-MODULES = ("__init__.py", "common.py", "runtime.py", "install.py")
+MODULES = ("agentloop.py", "install.py")
 
 # ~/.local/bin/agentloop keeps its path (the Stop hooks call it); it only imports the modules.
 # It fails open: if the modules are missing or from another version, `hook` exits 0 silently.
@@ -201,7 +200,7 @@ LAUNCHER = """#!%(python)s
 import sys
 sys.path.insert(0, %(lib)r)
 try:
-    from agentloop.runtime import VERSION, main
+    from agentloop import VERSION, main
     if VERSION != %(version)r:
         raise ImportError("modules are version %%s, launcher expects %(version)s" %% VERSION)
 except Exception as e:  # never let a broken install block an agent's Stop
@@ -275,7 +274,7 @@ def install(env, python, source):
     import py_compile
     lib, created = lib_dir(env), ch_.manifest["created"]
     for name in MODULES:
-        target = os.path.join(lib, "agentloop", name)
+        target = os.path.join(lib, name)
         text = read_text(os.path.join(pkg, name))
         if read_text(target) != text:
             atomic_write(target, text)

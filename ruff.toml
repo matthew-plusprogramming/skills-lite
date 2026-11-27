@@ -6,7 +6,6 @@
 # --exit-zero only covers findings: a bad config or a crash still exits 2, which should fail CI.
 target-version = "py38"              # the documented minimum (README, install.sh); do not raise
 extend-include = ["bin/agentloop"]   # extensionless script; Ruff skips it otherwise
-extend-exclude = ["tests/fixtures"]  # frozen copy of the released version
 
 [lint]
 select = [

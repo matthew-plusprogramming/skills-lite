@@ -18,9 +18,9 @@ def slurp(path):
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "bin", "agentloop")
-sys.path.insert(0, ROOT)
-import agentloop.install as ins
-import agentloop.runtime as al
+sys.path.insert(0, os.path.join(ROOT, "agentloop"))
+import agentloop as al
+import install as ins
 
 
 def tree_digest(root):
