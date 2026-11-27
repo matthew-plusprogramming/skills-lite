@@ -312,7 +312,7 @@ class InstallTest(BlackBox):
             stop = json.loads(self.read(rel))["hooks"]["Stop"]
             self.assertEqual(stop, [{"hooks": [{"type": "command", "timeout": 10,
                                                 "command": '"%s" hook %s' % (binp, agent)}]}], rel)
-        self.assertIn("[features]\nhooks = true\n", self.read(".codex/config.toml"))
+        self.assertEqual(self.read(".codex/config.toml"), 'model = "m"\n')  # Codex hooks default on
         self.assertIn("<!-- agentloop:begin -->", self.read(".codex/AGENTS.md"))
         self.assertIn("@../.codex/AGENTS.md", self.read(".claude/CLAUDE.md"))
         self.assertTrue(os.access(binp, os.X_OK))

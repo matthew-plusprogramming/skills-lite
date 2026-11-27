@@ -351,8 +351,7 @@ class InstallTest(Base):
     def test_fresh_home_creates_and_uninstall_removes(self):
         code, _, err = self.install()
         self.assertEqual(code, 0, err)
-        toml = self.read(".codex/config.toml")
-        self.assertTrue(al.toml_features_hooks(toml))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".codex", "config.toml")))  # hooks default on
         self.assertIn(ins.MARK_BEGIN, self.read(".claude/CLAUDE.md"))
         self.assertTrue(os.path.islink(os.path.join(self.home, ".claude", "skills", "review-plan")))
         self.run_cli("uninstall")
@@ -439,12 +438,49 @@ class InstallTest(Base):
         self.assertIn("not valid TOML", err)
         self.assertEqual(before, tree_digest(self.home))
 
-    def test_toml_features_variants(self):
-        for before in ("", 'model = "m"\n', '[features]\nother = 1\n', '[features]\nhooks = false\n'):
-            new = ins.toml_set_features_hooks(before)
-            self.assertTrue(al.toml_features_hooks(new), before)
-            restored = ins.toml_restore_features(new, ins.toml_features_line(before))
+    def test_legacy_features_flag_restored(self):
+        # What earlier installers wrote, and the "before" they recorded in the manifest.
+        cases = (("", "[features]\nhooks = true\n", "no-table"),
+                 ('model = "m"\n', 'model = "m"\n\n[features]\nhooks = true\n', "no-table"),
+                 ("[features]\nother = 1\n", "[features]\nhooks = true\nother = 1\n", "no-key"),
+                 ("[features]\nhooks = false\n", "[features]\nhooks = true\n", "hooks = false"))
+        for before, written, recorded in cases:
+            restored = ins.toml_restore_features(written, recorded)
             self.assertEqual(ins.norm_blank(restored), ins.norm_blank(before), before)
+
+    # Each spelling with the state Codex 0.171 reports for it (`codex features list`).
+    SPELLINGS = (("", None), ('model = "m"\n', None), ("[features]\nhooks = true\n", True),
+                 ("[features]\nhooks = false\n", False), ("[features]\nhooks = false # off\n", False),
+                 ("[features]\n# hooks = false\n", None), ("features.hooks = false\n", False),
+                 ('"features".hooks = false\n', False), ("features = { hooks = false }\n", False),
+                 ("[features]\ncodex_hooks = false\n", False), ("features.codex_hooks = false\n", False),
+                 ("features = { codex_hooks = false }\n", False),
+                 ("[features]\nhooks = true\ncodex_hooks = false\n", True),
+                 ("[features]\ncodex_hooks = true\nhooks = false\n", False),
+                 ("[profiles.p.features]\nhooks = false\n", None),
+                 ("[features]\nhooks\t= false\n", False), ("features\t.\thooks = false\n", False),
+                 ('note = """\n[features]\nhooks = false\n"""\n', None),
+                 ("note = '''\nfeatures.hooks = false\n'''\n[features]\nhooks = true\n", True),
+                 # quote runs that are not multi-line strings must not hide what follows
+                 ('# example: x = """\n[features]\nhooks = false\n', False),
+                 ('model = "m" # """\nfeatures.hooks = false\n', False),
+                 ("x = 'has \"\"\" inside'\nfeatures.hooks = false\n", False),
+                 ("x = '''a \"\"\" b'''\nfeatures.hooks = false\n", False),
+                 ('x = """a""" # """\nfeatures.hooks = false\n', False),
+                 ('x = """a \\""" b"""\nfeatures.hooks = false\n', False))
+
+    def test_features_hooks_spellings(self):
+        for text, want in self.SPELLINGS:
+            self.assertIs(al.toml_features_hooks(text), want, text)
+            got = al._toml_features_lines(text)  # the parser-free path used before Python 3.11
+            self.assertIs(got.get("hooks", got.get("codex_hooks")), want, text)
+
+    def test_health_warns_only_when_hooks_explicitly_off(self):
+        self.install()
+        self.assertNotIn("config.toml", " ".join(al.health(self.env)["codex"]))
+        for text in ("[features]\nhooks = false\n", "features.codex_hooks = false\n"):
+            self.write(".codex/config.toml", text)
+            self.assertIn("turned off in config.toml", " ".join(al.health(self.env)["codex"]), text)
 
     def test_install_sh_runs(self):
         env = dict(self.env, PATH=os.environ.get("PATH", "/usr/bin:/bin"))

@@ -44,43 +44,9 @@ def dump_json(data):
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-def toml_set_features_hooks(text):
-    """Return text with features.hooks = true (unchanged if already true)."""
-    if toml_features_hooks(text):
-        return text
-    lines = text.splitlines(True)
-    section, header_at = None, None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s.startswith("["):
-            section = s
-            if s == "[features]":
-                header_at = i
-        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
-            lines[i] = "hooks = true\n"
-            return "".join(lines)
-    if header_at is not None:
-        lines.insert(header_at + 1, "hooks = true\n")
-        return "".join(lines)
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return text + ("\n" if text else "") + "[features]\nhooks = true\n"
-
-
-def toml_features_line(text):
-    """Describe features.hooks before install: the exact line, 'no-key' or 'no-table'."""
-    section, has_table = None, False
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("["):
-            section = s
-            has_table = has_table or s == "[features]"
-        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
-            return line
-    return "no-key" if has_table else "no-table"
-
-
 def toml_restore_features(text, before):
+    """Undo `features.hooks = true` written by installers before this one; `before` is the
+    line they recorded, or 'no-key'/'no-table'. Kept so older installs still uninstall cleanly."""
     lines = text.splitlines(True)
     section = None
     for i, line in enumerate(lines):
@@ -302,11 +268,8 @@ def install(env, python, source):
         if add_hook(data, env, agent):
             ch_.write(path, dump_json(data), "added %s Stop hook to %s" % (agent, path))
 
-    # 3. Codex feature flag (remember the old value so uninstall can restore it)
-    new_toml = toml_set_features_hooks(toml)
-    if new_toml != toml:
-        ch_.manifest.setdefault("toml_features_before", toml_features_line(toml))
-        ch_.write(ct, new_toml, "set features.hooks = true in " + ct)
+    # 3. config.toml is left alone: Codex enables hooks by default, and an explicit
+    #    `hooks = false` is the user's choice (status warns about it).
 
     ch_.write(agents_md, agents_text, "updated guidance in " + agents_md)
     ch_.write(claude_md, claude_text, "updated guidance in " + claude_md)
@@ -324,6 +287,9 @@ def install(env, python, source):
         rc = {"zsh": "~/.zshrc", "bash": "~/.bashrc"}.get(shell, "~/.profile")
         print("agentloop: %s is not on PATH. Add this line to %s:" % (bindir, rc))
         print('  export PATH="$HOME/.local/bin:$PATH"')
+    if toml_features_hooks(toml) is False:
+        print("agentloop: Codex: hooks are turned off in %s [features], so its Stop hook will not "
+              "run; agentloop left that setting alone. Remove it to turn hooks on." % ct)
     if not health(env)["codex"] == []:
         print("agentloop: Codex: open `codex` once (in an empty folder) and choose "
               "'Trust all and continue' to enable its Stop hook.")
