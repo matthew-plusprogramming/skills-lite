@@ -309,23 +309,25 @@ class InstallTest(Base):
     def test_install_twice_then_uninstall_restores_bytes(self):
         self.seed()
         before = self.snapshot()
+        binp = os.path.join(self.home, ".local", "bin", "agentloop")
         code, out, err = self.install()
         self.assertEqual(code, 0, err)
         after1 = self.snapshot()
         s = json.loads(after1[".claude/settings.json"])
         self.assertEqual(s["hooks"]["PermissionRequest"], SETTINGS["hooks"]["PermissionRequest"])
         self.assertEqual(s["hooks"]["SessionStart"], SETTINGS["hooks"]["SessionStart"])
-        self.assertTrue(ins.is_ours(s["hooks"]["Stop"][0]["hooks"][0], "claude"))
+        self.assertEqual(s["hooks"]["Stop"], [{"hooks": [
+            {"type": "command", "command": '"%s" hook claude' % binp, "timeout": 10}]}])
         c = json.loads(after1[".codex/hooks.json"])
         self.assertEqual(c["hooks"]["SessionStart"], CODEX_HOOKS["hooks"]["SessionStart"])
-        self.assertTrue(ins.is_ours(c["hooks"]["Stop"][0]["hooks"][0], "codex"))
+        self.assertEqual(c["hooks"]["Stop"], [{"hooks": [
+            {"type": "command", "command": '"%s" hook codex' % binp, "timeout": 10}]}])
         self.assertEqual(after1[".codex/config.toml"], before[".codex/config.toml"])  # sandbox untouched
         self.assertIn("Use `agentloop` to record lifecycle steps", after1[".codex/AGENTS.md"])
         self.assertTrue(after1[".codex/AGENTS.md"].startswith(before[".codex/AGENTS.md"]))
         self.assertEqual(after1[".claude/CLAUDE.md"], before[".claude/CLAUDE.md"])  # imports AGENTS.md
         self.assertEqual(after1[".agents/skills/review-plan/SKILL.md"],
                          before[".agents/skills/review-plan/SKILL.md"])
-        binp = os.path.join(self.home, ".local", "bin", "agentloop")
         self.assertTrue(slurp(binp).startswith("#!/usr/bin/env-python -sS\n"))
         self.assertTrue(os.access(binp, os.X_OK))
         self.assertIn('export PATH="$HOME/.local/bin:$PATH"', out)
@@ -335,10 +337,11 @@ class InstallTest(Base):
         self.assertEqual(after1, self.snapshot())
         self.assertIn("nothing changed", out2)
 
-        # Simulate Codex writing its trust record for the new hook.
+        # Simulate Codex writing its trust record for the new hook (Codex's key format).
         toml_rel = ".codex/config.toml"
-        self.write(toml_rel, self.read(toml_rel) + "\n" + al.trust_key(self.env, 0)
-                   + '\ntrusted_hash = "sha256:11"\n')
+        self.assertIn("hook not trusted yet", " ".join(al.health(self.env)["codex"]))
+        self.write(toml_rel, self.read(toml_rel) + '\n[hooks.state."%s:stop:0:0"]\n'
+                   % os.path.join(self.home, ".codex", "hooks.json") + 'trusted_hash = "sha256:11"\n')
         self.assertEqual(al.health(self.env)["codex"], [])
 
         code, _, err = self.run_cli("uninstall")
@@ -446,7 +449,7 @@ class InstallTest(Base):
                  ("[features]\nhooks = false\n", "[features]\nhooks = true\n", "hooks = false"))
         for before, written, recorded in cases:
             restored = ins.toml_restore_features(written, recorded)
-            self.assertEqual(ins.norm_blank(restored), ins.norm_blank(before), before)
+            self.assertEqual(restored, before)
 
     # Each spelling with the state Codex 0.171 reports for it (`codex features list`).
     SPELLINGS = (("", None), ('model = "m"\n', None), ("[features]\nhooks = true\n", True),
