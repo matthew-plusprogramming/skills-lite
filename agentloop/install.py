@@ -343,14 +343,14 @@ def install_skills(env, src_root, ch_):
             ch_.log.append("now keeping %s in sync: it matches the bundled copy exactly" % dst)
         for p in mine:  # files an earlier version installed that are no longer bundled
             if p in created and p not in bundled and not os.path.islink(p) and \
-                    hashes.get(p) == sha256(read_text(p) or ""):
+                    not through_link(env, p) and hashes.get(p) == sha256(read_text(p) or ""):
                 os.unlink(p)
                 created.remove(p)
                 hashes.pop(p, None)
                 ch_.log.append("removed old skill file " + p)
         for t, s in sorted(bundled.items()):
-            if os.path.islink(t):
-                ch_.log.append("left %s alone: it is a symlink" % t)
+            if os.path.islink(t) or through_link(env, t):
+                ch_.log.append("left %s alone: it is or is reached through a symlink" % t)
                 continue
             new, old = read_text(s), read_text(t)
             if old == new:
@@ -367,6 +367,9 @@ def install_skills(env, src_root, ch_):
         if os.path.lexists(link):
             if not (os.path.islink(link) and os.path.realpath(link) == os.path.realpath(dst)):
                 ch_.log.append("left existing %s unchanged" % link)
+            continue
+        if os.path.islink(claude_skills):
+            ch_.log.append("left %s alone: it is a symlink" % claude_skills)
             continue
         os.makedirs(claude_skills, exist_ok=True)
         os.symlink(dst, link)
