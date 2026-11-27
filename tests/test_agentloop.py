@@ -457,12 +457,14 @@ class InstallTest(Base):
                  ("features = { codex_hooks = false }\n", False),
                  ("[features]\nhooks = true\ncodex_hooks = false\n", True),
                  ("[features]\ncodex_hooks = true\nhooks = false\n", False),
-                 ("[profiles.p.features]\nhooks = false\n", None))
+                 ("[profiles.p.features]\nhooks = false\n", None),
+                 ("[features]\nhooks\t= false\n", False), ("features\t.\thooks = false\n", False),
+                 ('note = """\n[features]\nhooks = false\n"""\n', None),
+                 ("note = '''\nfeatures.hooks = false\n'''\n[features]\nhooks = true\n", True))
 
     def test_features_hooks_spellings(self):
         for text, want in self.SPELLINGS:
             self.assertIs(al.toml_features_hooks(text), want, text)
-            self.assertIs(al.toml_features_hooks(text), al.toml_features_hooks(text))
             got = al._toml_features_lines(text)  # the parser-free path used before Python 3.11
             self.assertIs(got.get("hooks", got.get("codex_hooks")), want, text)
 

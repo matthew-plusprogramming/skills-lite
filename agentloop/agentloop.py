@@ -151,16 +151,24 @@ def toml_features_hooks(text):
 
 def _toml_features_lines(text):
     """Boolean keys under `features` for the spellings above, without a TOML parser."""
-    out, section = {}, ""
+    out, section, in_str = {}, "", None
     for line in text.splitlines():
+        if in_str:  # inside a multi-line string: nothing here is a key
+            if line.count(in_str) % 2:
+                in_str = None
+            continue
+        quote = next((q for q in ('"""', "'''") if line.count(q) % 2), None)
+        if quote:
+            in_str = quote
+            continue
         s = line.split("#", 1)[0].strip()
         if s.startswith("["):
-            section = s.strip("[]").replace('"', "").replace("'", "").replace(" ", "")
+            section = re.sub(r"[\s\"']", "", s.strip("[]"))
             continue
         key, eq, value = s.partition("=")
         if not eq:
             continue
-        path = ".".join(p for p in (section, key.replace('"', "").replace("'", "").replace(" ", "")) if p)
+        path = ".".join(p for p in (section, re.sub(r"[\s\"']", "", key)) if p)
         value = value.strip()
         if path == "features" and value.startswith("{"):
             for m in re.finditer(r"(?:^|[{,])\s*[\"']?(codex_hooks|hooks)[\"']?\s*=\s*(true|false)\b", value):

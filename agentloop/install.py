@@ -8,7 +8,8 @@ import time
 
 from agentloop import (HOOK_TIMEOUT, MARK_BEGIN, MARK_END, VERSION, UserError, atomic_write,
                        bin_path, claude_dir, codex_dir, find_hook, health, hook_command, home,
-                       is_ours, lib_dir, load_json, read_text, state_dir, trust_key)
+                       is_ours, lib_dir, load_json, read_text, state_dir, toml_features_hooks,
+                       trust_key)
 
 
 def add_hook(data, env, agent):
@@ -286,6 +287,9 @@ def install(env, python, source):
         rc = {"zsh": "~/.zshrc", "bash": "~/.bashrc"}.get(shell, "~/.profile")
         print("agentloop: %s is not on PATH. Add this line to %s:" % (bindir, rc))
         print('  export PATH="$HOME/.local/bin:$PATH"')
+    if toml_features_hooks(toml) is False:
+        print("agentloop: Codex: hooks are turned off in %s [features], so its Stop hook will not "
+              "run; agentloop left that setting alone. Remove it to turn hooks on." % ct)
     if not health(env)["codex"] == []:
         print("agentloop: Codex: open `codex` once (in an empty folder) and choose "
               "'Trust all and continue' to enable its Stop hook.")
