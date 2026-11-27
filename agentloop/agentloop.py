@@ -5,11 +5,8 @@ Runs on every Stop, so install-only code lives in install.py, which is imported 
 """
 import json
 import os
-import re
-import shutil
-import subprocess
+import re  # json imports re anyway, so this costs nothing extra
 import sys
-import tempfile
 import time
 
 try:
@@ -58,14 +55,17 @@ def lib_dir(env):
 
 
 def atomic_write(path, data):
+    """Write via a temp file in the same directory and rename, keeping the file's mode.
+    Plain os calls: tempfile and shutil would add ~5 ms of imports to every Stop."""
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".agentloop-")
+    tmp = os.path.join(d, ".agentloop-%d-%s" % (os.getpid(), os.path.basename(path)))
     try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
         if os.path.exists(path):
-            shutil.copymode(path, tmp)
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):
@@ -253,8 +253,13 @@ def _darwin_argv(pid):
 
 
 def _ps(pid, field):
-    out = subprocess.run(["ps", "-o", field + "=", "-p", str(pid)], capture_output=True,
-                         text=True, timeout=5).stdout.strip()
+    """Fallback when /proc and sysctl are unavailable; imported lazily (~4 ms) on that path only."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-o", field + "=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
     return out or None
 
 
@@ -299,7 +304,7 @@ def proc_info(pid, want_args=False):
                 except Exception:
                     argv = None
             args = argv if argv is not None else (_ps(pid, "args") or "").split()
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError):
         if info is None:
             return None
     return info[0], info[1], args
@@ -352,11 +357,12 @@ def current_session(env, start=None):
 
 
 def is_headless(agent, env, start=None):
+    if agent == "claude":
+        # `claude -p` and SDK runs set CLAUDE_CODE_ENTRYPOINT=sdk-* (checked on Claude Code
+        # 2.1.332), so no process walk is needed; that keeps ctypes off Claude's Stop path.
+        return env.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk")
     found = nearest_agent(env, start, want_args=True)
     args = found[2][1:] if found and found[0] == agent else []
-    if agent == "claude":
-        ep = env.get("CLAUDE_CODE_ENTRYPOINT", "")
-        return ep.startswith("sdk") or "-p" in args or "--print" in args
     return codex_subcommand(args) in ("exec", "e", "review")
 
 

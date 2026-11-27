@@ -216,8 +216,7 @@ class HookTest(BlackBox):
     def test_off_and_headless_never_block(self):
         self.assertIsNone(self.stop("claude", "h6", "t1", env={"AGENTLOOP": "off"}))
         self.assertIsNone(self.stop("claude", "h6", "t2", env={"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}))
-        self.assertIsNone(self.stop("claude", "h6", "t3", env={"CLAUDE_PID": "50"},
-                                    tree=[[50, "claude", ["claude", "-p", "hi"]]]))
+        self.assertIsNone(self.stop("claude", "h6", "t3", env={"CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}))
         self.assertIsNone(self.stop("codex", "h7", "u1", tree=[[70, "codex", ["codex", "exec", "hi"]]]))
         self.assertIn("no lifecycle step", self.stop("codex", "h7", "u2",
                                                      tree=[[70, "codex", ["codex", "--yolo"]]]))
@@ -235,6 +234,31 @@ class HookTest(BlackBox):
         self.assertEqual((r.returncode, r.stdout), (0, ""))
         r = self.run_al("hook", "other", stdin="{}")
         self.assertEqual((r.returncode, r.stdout), (0, ""))
+
+
+class HotPathTest(BlackBox):
+    """Keep the Stop hook lean: these modules cost ~2-5 ms each and the hook never needs them."""
+    BANNED = {"subprocess", "shutil", "hashlib", "tempfile", "install"}
+
+    def test_hook_and_record_paths_import_nothing_heavy(self):
+        probe = (
+            "import io, json, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from agentloop import main\n"
+            "sys.stdin = io.StringIO(sys.argv[2])\n"
+            "sys.stdout = io.StringIO()\n"
+            "main(sys.argv[1].split())\n"
+            "sys.stderr.write(json.dumps(sorted(sys.modules)))\n" % os.path.join(ROOT, "agentloop"))
+        payload = json.dumps({"session_id": "m1", "prompt_id": "p1", "hook_event_name": "Stop"})
+        env = dict(self.base_env, CLAUDE_PID="50", CLAUDE_CODE_SESSION_ID="m1",
+                   AGENTLOOP_TEST_PROCTREE=json.dumps(CLAUDE_TREE))
+        for argv in ("hook claude", "plan x", "status"):
+            r = subprocess.run([sys.executable, "-sS", "-c", probe, argv, payload],
+                               capture_output=True, text=True, env=env)
+            loaded = set(json.loads(r.stderr.strip().splitlines()[-1]))
+            self.assertEqual(loaded & self.BANNED, set(), argv)
+            if argv == "hook claude":  # Claude's hook needs no process walk, so no ctypes
+                self.assertNotIn("ctypes", loaded)
 
 
 SETTINGS = {"permissions": {"defaultMode": "default"},

@@ -195,7 +195,10 @@ MODULES = ("agentloop.py", "install.py")
 
 # ~/.local/bin/agentloop keeps its path (the Stop hooks call it); it only imports the modules.
 # It fails open: if the modules are missing or from another version, `hook` exits 0 silently.
-LAUNCHER = """#!%(python)s
+# -sS (one combined flag: Linux passes a single shebang argument) skips site-packages;
+# agentloop is stdlib-only. Not -I: it implies -E, which on Apple's /usr/bin/python3 drops
+# the stdlib bytecode cache and recompiles json/re on every Stop (~45 ms instead of ~20).
+LAUNCHER = """#!%(python)s -sS
 # agentloop launcher, installed by skills-lite. Code: %(lib)s
 import sys
 sys.path.insert(0, %(lib)r)
