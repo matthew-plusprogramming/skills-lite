@@ -19,7 +19,7 @@ Codex runs a new hook only after you trust it: open `codex` once (in an empty fo
 The installer works user-wide, for Claude Code and Codex:
 
 - Installs the `agentloop` CLI to `~/.local/bin/agentloop`, a launcher for its code in `~/.local/share/agentloop`.
-- Adds one `Stop` hook to `~/.claude/settings.json` and one to `~/.codex/hooks.json`, and sets `features.hooks = true` in `~/.codex/config.toml`. Hooks are enabled on install.
+- Adds one `Stop` hook to `~/.claude/settings.json` and one to `~/.codex/hooks.json`, Codex enables hooks by default, so `~/.codex/config.toml` is left alone; `agentloop status` warns if it turns hooks off (`hooks = false` or the older `codex_hooks = false` under `features`).
 - Installs the full work loop from the repository’s `AGENTS.md` into a marked section of `~/.codex/AGENTS.md`. Claude imports that file from `~/.claude/CLAUDE.md`. Re-running the installer upgrades the previous reminder and preserves personal instructions outside the marked section.
 - Copies `skills/` into `~/.agents/skills`, backing up any file that differs, and links each skill into `~/.claude/skills` where no entry exists yet.
 

@@ -129,14 +129,45 @@ def find_hook(data, agent):
 
 
 def toml_features_hooks(text):
-    section = None
+    """Codex's hooks feature in config.toml: True, False, or None when unset (Codex 0.171
+    enables hooks by default). Reads every spelling Codex accepts: a [features] table, dotted
+    `features.hooks`, inline `features = {...}`, and the legacy `codex_hooks` alias; when both
+    keys are set, `hooks` wins, as in Codex. Profile tables are ignored: they apply only when
+    that profile is selected."""
+    feats = {}
+    try:
+        import tomllib
+        f = tomllib.loads(text).get("features")
+        feats = f if isinstance(f, dict) else {}
+    except ImportError:  # Python < 3.11: line-based fallback below
+        feats = _toml_features_lines(text)
+    except Exception:  # invalid TOML: Codex refuses it too; report what the lines say
+        feats = _toml_features_lines(text)
+    for key in ("hooks", "codex_hooks"):
+        if isinstance(feats.get(key), bool):
+            return feats[key]
+    return None
+
+
+def _toml_features_lines(text):
+    """Boolean keys under `features` for the spellings above, without a TOML parser."""
+    out, section = {}, ""
     for line in text.splitlines():
-        s = line.strip()
+        s = line.split("#", 1)[0].strip()
         if s.startswith("["):
-            section = s
-        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
-            return s.split("=", 1)[1].split("#")[0].strip() == "true"
-    return False
+            section = s.strip("[]").replace('"', "").replace("'", "").replace(" ", "")
+            continue
+        key, eq, value = s.partition("=")
+        if not eq:
+            continue
+        path = ".".join(p for p in (section, key.replace('"', "").replace("'", "").replace(" ", "")) if p)
+        value = value.strip()
+        if path == "features" and value.startswith("{"):
+            for m in re.finditer(r"(?:^|[{,])\s*[\"']?(codex_hooks|hooks)[\"']?\s*=\s*(true|false)\b", value):
+                out.setdefault(m.group(1), m.group(2) == "true")
+        elif path in ("features.hooks", "features.codex_hooks") and value in ("true", "false"):
+            out.setdefault(path[9:], value == "true")
+    return out
 
 
 def trust_key(env, group_index):
@@ -446,8 +477,9 @@ def health(env):
         out["codex"].append("Stop hook not configured (run install.sh)")
     else:
         toml = read_text(os.path.join(codex_dir(env), "config.toml")) or ""
-        if not toml_features_hooks(toml):
-            out["codex"].append("features.hooks is not true in config.toml")
+        if toml_features_hooks(toml) is False:
+            out["codex"].append("hooks are turned off in config.toml [features]; "
+                                "remove that setting to let the Stop hook run")
         if trust_key(env, idx[0]) not in toml:
             out["codex"].append("hook not trusted yet: open codex and choose 'Trust all and continue'")
     if not os.path.exists(bin_path(env)):
