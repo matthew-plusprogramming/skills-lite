@@ -313,8 +313,8 @@ def health(env):
         out["codex"].append("Stop hook not configured (run install.sh)")
     else:
         toml = read_text(os.path.join(codex_dir(env), "config.toml")) or ""
-        if not toml_features_hooks(toml):
-            out["codex"].append("features.hooks is not true in config.toml")
+        if toml_features_hooks(toml) is False:
+            out["codex"].append("hooks = false in config.toml [features] turns the Stop hook off")
         if trust_key(env, idx[0]) not in toml:
             out["codex"].append("hook not trusted yet: open codex and choose 'Trust all and continue'")
     if not os.path.exists(bin_path(env)):

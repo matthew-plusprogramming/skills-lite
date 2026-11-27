@@ -7,7 +7,7 @@ import sys
 
 from agentloop.common import (MARK_BEGIN, MARK_END, HOOK_TIMEOUT, UserError, atomic_write,
                               bin_path, claude_dir, codex_dir, find_hook, hook_command, home,
-                              is_ours, lib_dir, load_json, read_text, state_dir, toml_features_hooks,
+                              is_ours, lib_dir, load_json, read_text, state_dir,
                               trust_key)
 from agentloop.runtime import VERSION, health
 
@@ -44,43 +44,9 @@ def dump_json(data):
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-def toml_set_features_hooks(text):
-    """Return text with features.hooks = true (unchanged if already true)."""
-    if toml_features_hooks(text):
-        return text
-    lines = text.splitlines(True)
-    section, header_at = None, None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s.startswith("["):
-            section = s
-            if s == "[features]":
-                header_at = i
-        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
-            lines[i] = "hooks = true\n"
-            return "".join(lines)
-    if header_at is not None:
-        lines.insert(header_at + 1, "hooks = true\n")
-        return "".join(lines)
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return text + ("\n" if text else "") + "[features]\nhooks = true\n"
-
-
-def toml_features_line(text):
-    """Describe features.hooks before install: the exact line, 'no-key' or 'no-table'."""
-    section, has_table = None, False
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("["):
-            section = s
-            has_table = has_table or s == "[features]"
-        elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
-            return line
-    return "no-key" if has_table else "no-table"
-
-
 def toml_restore_features(text, before):
+    """Undo `features.hooks = true` written by installers before this one (kept so older
+    installs still uninstall byte for byte); `before` is the line or 'no-key'/'no-table'."""
     lines = text.splitlines(True)
     section = None
     for i, line in enumerate(lines):
@@ -300,12 +266,6 @@ def install(env, python, source):
         data = prepared[path]
         if add_hook(data, env, agent):
             ch_.write(path, dump_json(data), "added %s Stop hook to %s" % (agent, path))
-
-    # 3. Codex feature flag (remember the old value so uninstall can restore it)
-    new_toml = toml_set_features_hooks(toml)
-    if new_toml != toml:
-        ch_.manifest.setdefault("toml_features_before", toml_features_line(toml))
-        ch_.write(ct, new_toml, "set features.hooks = true in " + ct)
 
     ch_.write(agents_md, agents_text, "updated guidance in " + agents_md)
     ch_.write(claude_md, claude_text, "updated guidance in " + claude_md)

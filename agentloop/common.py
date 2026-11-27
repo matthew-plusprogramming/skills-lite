@@ -124,6 +124,8 @@ def find_hook(data, agent):
 
 
 def toml_features_hooks(text):
+    """Value of [features] hooks in config.toml: True, False, or None when unset.
+    Codex enables hooks by default, so only an explicit False turns the Stop hook off."""
     section = None
     for line in text.splitlines():
         s = line.strip()
@@ -131,7 +133,7 @@ def toml_features_hooks(text):
             section = s
         elif section == "[features]" and s.replace(" ", "").startswith("hooks="):
             return s.split("=", 1)[1].split("#")[0].strip() == "true"
-    return False
+    return None
 
 
 def trust_key(env, group_index):
