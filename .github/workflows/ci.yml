@@ -1,0 +1,43 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, python: "3.8" }   # oldest supported Python; ubuntu-22.04 runners end 2027-04
+          - { os: ubuntu-latest, python: "3.x" }
+          - { os: macos-latest, python: "3.x" }
+          - { os: macos-latest, python: system }  # /usr/bin/python3, what install.sh falls back to
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: matrix.python != 'system'
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Select interpreter
+        run: |
+          if [ "${{ matrix.python }}" = system ]; then echo "PY=/usr/bin/python3" >> "$GITHUB_ENV"; else echo "PY=python" >> "$GITHUB_ENV"; fi
+      - name: Unit and black-box tests
+        run: $PY --version && $PY -m unittest discover -s tests -v
+      - name: Stop-hook latency (informational; CI runners are noisy)
+        run: $PY tests/bench_hook.py --runs 30
+
+  ruff:  # warn mode: reports, never fails, until a rule earns blocking (see ruff.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # --exit-zero: findings never fail the job; a broken config or crash still exits 2 and does.
+      # Annotations are downgraded to warnings. (--statistics cannot be combined with github output.)
+      - name: Ruff (warn only)
+        shell: bash  # -eo pipefail, so Ruff's own exit status survives the sed
+        run: pipx run --spec ruff==0.17.6 ruff check --exit-zero --output-format github . | sed 's/^::error /::warning /'
