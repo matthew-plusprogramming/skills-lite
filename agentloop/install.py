@@ -273,6 +273,7 @@ def install(env, python, source):
         raise UserError("agentloop: %s exists and is not agentloop; nothing was changed" % dest)
     import py_compile
     lib, created = lib_dir(env), ch_.manifest["created"]
+    lib_is_ours = lib in created or not os.path.lexists(lib)  # never rmtree a dir we found
     for name in MODULES:
         target = os.path.join(lib, name)
         text = read_text(os.path.join(pkg, name))
@@ -282,7 +283,7 @@ def install(env, python, source):
         cfile = pyc_path(target)
         py_compile.compile(target, cfile=cfile, doraise=True)
         created.extend(p for p in (target, cfile) if p not in created)
-    if lib not in created:
+    if lib_is_ours and lib not in created:
         created.append(lib)
     new_bin = LAUNCHER % {"python": python or sys.executable, "lib": lib, "version": VERSION}
     if read_text(dest) != new_bin:

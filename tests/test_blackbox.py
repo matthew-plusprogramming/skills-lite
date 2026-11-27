@@ -5,6 +5,7 @@ be restructured or reimplemented safely.
 Run: python3 -m unittest discover -s tests
 Point the suite at another build with AGENTLOOP_UNDER_TEST='["/path/to/agentloop"]'.
 """
+import atexit
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ def v1_script():
             raise RuntimeError("released agentloop %s not available from git: %s"
                                % (V1_COMMIT[:7], r.stderr.decode(errors="replace").strip()))
         d = tempfile.mkdtemp(prefix="agentloop-v1-")
+        atexit.register(shutil.rmtree, d, True)
         _v1["path"] = os.path.join(d, "agentloop-v1.py")
         with open(_v1["path"], "wb") as f:
             f.write(r.stdout)
@@ -261,6 +263,17 @@ class InstallTest(BlackBox):
         }
         for rel, text in self.files.items():
             self.write(rel, text)
+
+    def test_uninstall_keeps_a_share_dir_it_did_not_create(self):
+        foreign = os.path.join(self.home, ".local", "share", "agentloop", "notes.txt")
+        os.makedirs(os.path.dirname(foreign))
+        with open(foreign, "w") as f:
+            f.write("mine\n")
+        self.assertEqual(self.install().returncode, 0)
+        r = self.run_al("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(slurp(foreign), "mine\n")
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(foreign), "agentloop.py")))
 
     def install(self, python="/usr/bin/env-python"):
         return self.run_al("install", "--python", python, "--source", ROOT)
