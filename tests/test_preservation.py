@@ -147,9 +147,13 @@ class Preservation(unittest.TestCase):
         os.makedirs(root)
         os.makedirs(self.p(".agents"))
         os.symlink(root, self.p(".agents/skills"))
+        mine = os.path.join(root, "review-plan", "SKILL.md")
+        self.write(mine, "# mine\n")
         self.al("install")
         self.al("uninstall")
-        self.assertEqual(os.listdir(root), [])
+        self.assertEqual(os.listdir(root), ["review-plan"])
+        self.assertEqual(os.listdir(os.path.dirname(mine)), ["SKILL.md"])
+        self.assertEqual(self.read(mine), b"# mine\n")
 
     def test_skill_moved_to_dotfiles_after_install_is_not_deleted_through_the_link(self):
         self.al("install")
@@ -187,13 +191,25 @@ class Preservation(unittest.TestCase):
         self.al("uninstall")
         self.assertEqual(self.read(os.path.join(ref, "a.md")), b"my a\n")
 
+    def test_unchanged_subfolder_moved_to_dotfiles_is_not_deleted_through_the_link(self):
+        src = self.source({"ref/a.md": "bundle a\n"})
+        self.al("install", source=src)
+        ref = os.path.join(self.dots, "ref")
+        shutil.move(self.p(SKILL_DIR + "/ref"), ref)  # unchanged: its hash still matches
+        os.symlink(ref, self.p(SKILL_DIR + "/ref"))
+        self.al("uninstall")
+        self.assertEqual(self.read(os.path.join(ref, "a.md")), b"bundle a\n")
+
     def test_symlinked_dot_agents_is_never_written_through(self):
         agents = os.path.join(self.dots, "agents")
         os.makedirs(os.path.join(agents, "skills"))
         os.symlink(agents, self.p(".agents"))
+        mine = os.path.join(agents, "skills", "review-plan", "SKILL.md")
+        self.write(mine, "# mine\n")
         self.al("install")
         self.al("uninstall")
-        self.assertEqual(os.listdir(os.path.join(agents, "skills")), [])
+        self.assertEqual(os.listdir(os.path.dirname(mine)), ["SKILL.md"])
+        self.assertEqual(self.read(mine), b"# mine\n")
 
     def test_symlinked_claude_skills_folder_outside_home_gets_no_link(self):
         cfg = os.path.join(self.tmp, "claude-config")
@@ -232,6 +248,46 @@ class Preservation(unittest.TestCase):
         self.write(SKILL, "my edit\n")
         self.al("uninstall")
         self.assertEqual(self.read(SKILL), b"my edit\n")
+
+    def test_edit_overwritten_by_a_bundle_update_is_backed_up(self):
+        src = self.source()
+        self.al("install", source=src)
+        self.write(SKILL, "my edit\n")
+        self.source({"SKILL.md": "# bundle v2\n"})
+        self.al("install", source=src)
+        self.assertEqual(self.read(SKILL), b"# bundle v2\n")
+        baks = [f for f in os.listdir(self.p(SKILL_DIR)) if f.startswith("SKILL.md.agentloop-bak-")]
+        self.assertEqual([self.read(os.path.join(SKILL_DIR, f)) for f in baks], [b"my edit\n"])
+
+    def test_non_utf8_skill_files_never_crash_or_get_deleted(self):
+        src = self.source({"old.md": "bundled old\n"})
+        self.al("install", source=src)
+        self.write(SKILL_DIR + "/old.md", b"\xff\xfe mine")  # edited, then dropped by the bundle
+        self.write(SKILL, b"\xff mine too")  # edited, still bundled
+        os.unlink(os.path.join(src, "skills", "review-plan", "old.md"))
+        self.al("install", source=src)
+        self.assertEqual(self.read(SKILL_DIR + "/old.md"), b"\xff\xfe mine")  # kept as edited
+        baks = [f for f in os.listdir(self.p(SKILL_DIR)) if f.startswith("SKILL.md.agentloop-bak-")]
+        self.assertEqual([self.read(os.path.join(SKILL_DIR, f)) for f in baks], [b"\xff mine too"])
+        self.write(SKILL, b"\xff edited again")
+        self.al("uninstall")
+        self.assertEqual(self.read(SKILL), b"\xff edited again")
+
+    def test_non_utf8_same_name_skill_is_left_alone(self):
+        self.write(SKILL, b"\xff mine")
+        self.al("install")
+        self.assertEqual(self.read(SKILL), b"\xff mine")
+
+    def test_deleted_file_of_a_taken_over_skill_does_not_break_install(self):
+        self.write(SKILL, bundled_skill())  # identical copy: taken over, kept on uninstall
+        self.al("install")
+        os.unlink(self.p(SKILL))
+        self.al("install")
+        self.al("install")
+        self.assertEqual(self.read(SKILL), bundled_skill().encode())
+        self.assertEqual(os.listdir(self.p(SKILL_DIR)), ["SKILL.md"])  # nothing to back up
+        self.al("uninstall")
+        self.assertTrue(os.path.exists(self.p(SKILL)))  # still counted as the user's
 
     def test_dropped_skill_file_removed_only_if_unchanged(self):
         src = self.source({"old.md": "bundled old\n", "edited.md": "bundled edited\n"})

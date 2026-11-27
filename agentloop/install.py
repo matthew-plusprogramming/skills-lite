@@ -299,6 +299,24 @@ def sha256(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+UNREADABLE = object()  # a file that is not UTF-8 text: never equal to a bundled one
+
+
+def skill_text(path):
+    """Text of a file under a skill folder, None if missing, UNREADABLE if not UTF-8 (the
+    user put something else there): treated as edited, so it is backed up or left alone."""
+    try:
+        return read_text(path)
+    except (UnicodeDecodeError, IsADirectoryError):
+        return UNREADABLE
+
+
+def unchanged(path, want):
+    """True only if path still holds the text whose hash agentloop recorded."""
+    text = skill_text(path)
+    return bool(want) and isinstance(text, str) and sha256(text) == want
+
+
 def through_link(env, path):
     """True if a folder between HOME and path is a symlink. Skill files are never written or
     deleted through one: the real files would be somewhere agentloop did not choose."""
@@ -331,11 +349,12 @@ def install_skills(env, src_root, ch_):
             ch_.log.append("left %s alone: it is reached through a symlink" % dst)
             continue
         mine = [os.path.join(r, f) for r, _, fs in os.walk(dst) for f in fs] if os.path.isdir(dst) else []
-        if os.path.lexists(dst) and not any(p in created or p in preexisting for p in mine):
+        recorded = any(p.startswith(dst + os.sep) for p in created + preexisting)
+        if os.path.lexists(dst) and not recorded:
             # Not recorded as agentloop's. Take it over only if it is exactly the bundled copy
             # (an earlier install, or a lost manifest): nothing of the user's can be lost then.
             if not (os.path.isdir(dst) and set(mine) == set(bundled) and all(
-                    not os.path.islink(p) and read_text(p) == read_text(bundled[p]) for p in mine)):
+                    not os.path.islink(p) and skill_text(p) == read_text(bundled[p]) for p in mine)):
                 ch_.log.append("left %s alone: a skill with that name exists and agentloop did "
                                "not create it" % dst)
                 continue
@@ -343,7 +362,7 @@ def install_skills(env, src_root, ch_):
             ch_.log.append("now keeping %s in sync: it matches the bundled copy exactly" % dst)
         for p in mine:  # files an earlier version installed that are no longer bundled
             if p in created and p not in bundled and not os.path.islink(p) and \
-                    not through_link(env, p) and hashes.get(p) == sha256(read_text(p) or ""):
+                    not through_link(env, p) and unchanged(p, hashes.get(p)):
                 os.unlink(p)
                 created.remove(p)
                 hashes.pop(p, None)
@@ -352,13 +371,13 @@ def install_skills(env, src_root, ch_):
             if os.path.islink(t) or through_link(env, t):
                 ch_.log.append("left %s alone: it is or is reached through a symlink" % t)
                 continue
-            new, old = read_text(s), read_text(t)
+            new, old = read_text(s), skill_text(t)
             if old == new:
                 continue
-            if old is None and t not in preexisting:
-                created.append(t)
-            else:
+            if old is not None:
                 shutil.copy2(t, "%s.agentloop-bak-%s" % (t, ch_.stamp))
+            elif t not in preexisting and t not in created:
+                created.append(t)  # a taken-over file the user deleted stays theirs
             if t in created:
                 hashes[t] = sha256(new)
             os.makedirs(os.path.dirname(t), exist_ok=True)
@@ -440,7 +459,7 @@ def uninstall(env):
             done.append("kept %s: it is reached through a symlinked folder" % path)
             continue
         if want and os.path.isfile(path) and not os.path.islink(path):
-            if hashlib.sha256((read_text(path) or "").encode("utf-8")).hexdigest() != want:
+            if not unchanged(path, want):
                 done.append("kept edited " + path)
                 continue
         if os.path.islink(path) or os.path.isfile(path):
