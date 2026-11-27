@@ -5,6 +5,8 @@ be restructured or reimplemented safely.
 Run: python3 -m unittest discover -s tests
 Point the suite at another build with AGENTLOOP_UNDER_TEST='["/path/to/agentloop"]'.
 """
+import atexit
+import hashlib
 import json
 import os
 import shutil
@@ -20,6 +22,34 @@ CMD = json.loads(os.environ["AGENTLOOP_UNDER_TEST"]) if os.environ.get("AGENTLOO
 
 CLAUDE_TREE = [[100, "zsh", ["zsh"]], [50, "claude", ["claude"]]]
 CODEX_TREE = [[100, "zsh", ["zsh"]], [70, "codex", ["codex"]]]
+
+
+# The released single-file agentloop, read from git history for the compatibility tests rather
+# than vendored. Shallow clones (CI checkouts) fetch just this commit; without it the tests fail.
+V1_COMMIT = "dfffe92a9a4544549037252efa28d833ec505b58"
+V1_SHA256 = "dcb340f90a75f3deae8a36c372ffdd80f26bc0cbbab9a9b923b6a2c481b87e65"
+_v1 = {}
+
+
+def v1_script():
+    if "path" not in _v1:
+        def show():
+            return subprocess.run(["git", "-C", ROOT, "show", V1_COMMIT + ":bin/agentloop"],
+                                  capture_output=True)
+        r = show()
+        if r.returncode:
+            subprocess.run(["git", "-C", ROOT, "fetch", "-q", "--depth", "1", "origin", V1_COMMIT],
+                           capture_output=True)
+            r = show()
+        if r.returncode or hashlib.sha256(r.stdout).hexdigest() != V1_SHA256:
+            raise RuntimeError("released agentloop %s not available from git: %s"
+                               % (V1_COMMIT[:7], r.stderr.decode(errors="replace").strip()))
+        d = tempfile.mkdtemp(prefix="agentloop-v1-")
+        atexit.register(shutil.rmtree, d, True)
+        _v1["path"] = os.path.join(d, "agentloop-v1.py")
+        with open(_v1["path"], "wb") as f:
+            f.write(r.stdout)
+    return _v1["path"]
 
 
 def slurp(path):
@@ -234,6 +264,17 @@ class InstallTest(BlackBox):
         for rel, text in self.files.items():
             self.write(rel, text)
 
+    def test_uninstall_keeps_a_share_dir_it_did_not_create(self):
+        foreign = os.path.join(self.home, ".local", "share", "agentloop", "notes.txt")
+        os.makedirs(os.path.dirname(foreign))
+        with open(foreign, "w") as f:
+            f.write("mine\n")
+        self.assertEqual(self.install().returncode, 0)
+        r = self.run_al("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(slurp(foreign), "mine\n")
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(foreign), "agentloop.py")))
+
     def install(self, python="/usr/bin/env-python"):
         return self.run_al("install", "--python", python, "--source", ROOT)
 
@@ -293,6 +334,62 @@ class InstallTest(BlackBox):
         r = self.install()
         self.assertEqual(r.returncode, 2)
         self.assertIn("is not agentloop", r.stderr)
+
+    def run_v1(self, *argv):
+        """The released single-file agentloop (main at dfffe92), for compatibility tests."""
+        e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
+        return subprocess.run([sys.executable, v1_script()]
+                              + list(argv), capture_output=True, text=True, env=e)
+
+    def lib(self, *parts):
+        return os.path.join(self.home, ".local", "share", "agentloop", *parts)
+
+    def test_upgrade_from_v1_then_uninstall_restores_bytes(self):
+        self.seed()
+        r = self.run_v1("install", "--python", "/usr/bin/env-python", "--source", ROOT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        binp = os.path.join(self.home, ".local", "bin", "agentloop")
+        self.assertIn("agentloop launcher", slurp(binp))
+        self.assertEqual(len(json.loads(self.read(".claude/settings.json"))["hooks"]["Stop"]), 1)
+        r = self.run_al("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for rel, text in self.files.items():
+            self.assertEqual(self.read(rel), text, rel)
+        self.assertFalse(os.path.exists(binp))
+        self.assertFalse(os.path.exists(self.lib()))
+
+    def test_v1_uninstall_over_new_install(self):
+        self.seed()
+        self.assertEqual(self.install().returncode, 0)
+        r = self.run_v1("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for rel, text in self.files.items():
+            self.assertEqual(self.read(rel), text, rel)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "agentloop")))
+        leftovers = [os.path.join(d, f) for d, _, fs in os.walk(self.lib()) for f in fs]
+        self.assertEqual(leftovers, [])  # the old uninstall leaves only empty directories
+
+    def test_launcher_fails_open_when_modules_missing_or_mismatched(self):
+        self.assertEqual(self.install(python=sys.executable).returncode, 0)
+        binp = os.path.join(self.home, ".local", "bin", "agentloop")
+        e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
+        payload = json.dumps({"session_id": "f1", "prompt_id": "p1", "hook_event_name": "Stop"})
+        runtime = self.lib("agentloop.py")
+        text = slurp(runtime)
+        shutil.rmtree(self.lib("__pycache__"))
+        with open(runtime, "w") as f:
+            f.write(text.replace('VERSION = "', 'VERSION = "old-'))
+        for state in ("version mismatch", "module missing"):
+            if state == "module missing":
+                os.unlink(runtime)
+            h = subprocess.run([binp, "hook", "claude"], input=payload, capture_output=True, text=True, env=e)
+            self.assertEqual((h.returncode, h.stdout), (0, ""))
+            st = subprocess.run([binp, "status"], capture_output=True, text=True, env=e)
+            self.assertEqual(st.returncode, 2)
+            self.assertIn("installation is incomplete", st.stderr, state)
+        self.assertIn("launcher:", self.read(".local/state/agentloop/log"))
 
     def test_install_sh_round_trip(self):
         e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")

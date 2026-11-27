@@ -1,8 +1,6 @@
 """Tests for bin/agentloop. Run: python3 -m unittest discover -s tests"""
 import contextlib
 import hashlib
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
@@ -20,10 +18,9 @@ def slurp(path):
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "bin", "agentloop")
-_loader = importlib.machinery.SourceFileLoader("agentloop", SCRIPT)
-_spec = importlib.util.spec_from_loader("agentloop", _loader)
-al = importlib.util.module_from_spec(_spec)
-_loader.exec_module(al)
+sys.path.insert(0, os.path.join(ROOT, "agentloop"))
+import agentloop as al
+import install as ins
 
 
 def tree_digest(root):
@@ -317,10 +314,10 @@ class InstallTest(Base):
         s = json.loads(after1[".claude/settings.json"])
         self.assertEqual(s["hooks"]["PermissionRequest"], SETTINGS["hooks"]["PermissionRequest"])
         self.assertEqual(s["hooks"]["SessionStart"], SETTINGS["hooks"]["SessionStart"])
-        self.assertTrue(al.is_ours(s["hooks"]["Stop"][0]["hooks"][0], "claude"))
+        self.assertTrue(ins.is_ours(s["hooks"]["Stop"][0]["hooks"][0], "claude"))
         c = json.loads(after1[".codex/hooks.json"])
         self.assertEqual(c["hooks"]["SessionStart"], CODEX_HOOKS["hooks"]["SessionStart"])
-        self.assertTrue(al.is_ours(c["hooks"]["Stop"][0]["hooks"][0], "codex"))
+        self.assertTrue(ins.is_ours(c["hooks"]["Stop"][0]["hooks"][0], "codex"))
         self.assertEqual(after1[".codex/config.toml"], before[".codex/config.toml"])  # sandbox untouched
         self.assertIn("Use `agentloop` to record lifecycle steps", after1[".codex/AGENTS.md"])
         self.assertTrue(after1[".codex/AGENTS.md"].startswith(before[".codex/AGENTS.md"]))
@@ -355,7 +352,7 @@ class InstallTest(Base):
         self.assertEqual(code, 0, err)
         toml = self.read(".codex/config.toml")
         self.assertTrue(al.toml_features_hooks(toml))
-        self.assertIn(al.MARK_BEGIN, self.read(".claude/CLAUDE.md"))
+        self.assertIn(ins.MARK_BEGIN, self.read(".claude/CLAUDE.md"))
         self.assertTrue(os.path.islink(os.path.join(self.home, ".claude", "skills", "review-plan")))
         self.run_cli("uninstall")
         for rel in (".claude/settings.json", ".codex/hooks.json", ".codex/AGENTS.md",
@@ -364,7 +361,7 @@ class InstallTest(Base):
         self.assertFalse(os.path.lexists(os.path.join(self.home, ".claude", "skills", "review-plan")))
 
     def test_upgrade_old_guidance_preserves_notes_and_imports_full_loop(self):
-        old = al.MARK_BEGIN + "\n## Lifecycle\nOld reminder\n" + al.MARK_END + "\n"
+        old = ins.MARK_BEGIN + "\n## Lifecycle\nOld reminder\n" + ins.MARK_END + "\n"
         for path in (".codex/AGENTS.md", ".claude/CLAUDE.md"):
             self.write(path, "Personal notes\n\n" + old + "More notes\n")
         for _ in range(2):
@@ -375,7 +372,7 @@ class InstallTest(Base):
             for content in (agents, claude):
                 self.assertTrue(content.startswith("Personal notes\n\n"))
                 self.assertTrue(content.endswith("More notes\n"))
-                self.assertEqual(content.count(al.MARK_BEGIN), 1)
+                self.assertEqual(content.count(ins.MARK_BEGIN), 1)
                 self.assertNotIn("Old reminder", content)
             self.assertIn("wait for my explicit approval", agents)
             self.assertIn("Have a separate verifier", agents)
@@ -443,10 +440,10 @@ class InstallTest(Base):
 
     def test_toml_features_variants(self):
         for before in ("", 'model = "m"\n', '[features]\nother = 1\n', '[features]\nhooks = false\n'):
-            new = al.toml_set_features_hooks(before)
+            new = ins.toml_set_features_hooks(before)
             self.assertTrue(al.toml_features_hooks(new), before)
-            restored = al.toml_restore_features(new, al.toml_features_line(before))
-            self.assertEqual(al.norm_blank(restored), al.norm_blank(before), before)
+            restored = ins.toml_restore_features(new, ins.toml_features_line(before))
+            self.assertEqual(ins.norm_blank(restored), ins.norm_blank(before), before)
 
     def test_install_sh_runs(self):
         env = dict(self.env, PATH=os.environ.get("PATH", "/usr/bin:/bin"))
