@@ -295,39 +295,104 @@ def install(env, python, source):
               "'Trust all and continue' to enable its Stop hook.")
 
 
+def sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+UNREADABLE = object()  # a file that is not UTF-8 text: never equal to a bundled one
+
+
+def skill_text(path):
+    """Text of a file under a skill folder, None if missing, UNREADABLE if not UTF-8 (the
+    user put something else there): treated as edited, so it is backed up or left alone."""
+    try:
+        return read_text(path)
+    except (UnicodeDecodeError, IsADirectoryError):
+        return UNREADABLE
+
+
+def unchanged(path, want):
+    """True only if path still holds the text whose hash agentloop recorded."""
+    text = skill_text(path)
+    return bool(want) and isinstance(text, str) and sha256(text) == want
+
+
+def through_link(env, path):
+    """True if a folder between HOME and path is a symlink. Skill files are never written or
+    deleted through one: the real files would be somewhere agentloop did not choose."""
+    base = home(env)
+    rel = os.path.relpath(os.path.dirname(path), base)
+    cur = base
+    for part in ([] if rel == "." or rel.startswith("..") else rel.split(os.sep)):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return True
+    return False
+
+
 def install_skills(env, src_root, ch_):
     agents_skills = os.path.join(home(env), ".agents", "skills")
     claude_skills = os.path.join(claude_dir(env), "skills")
+    created, hashes = ch_.manifest["created"], ch_.manifest.setdefault("hashes", {})
+    # Skill files that were already there, identical to the bundle, when agentloop took them
+    # over: kept in sync like its own, but left in place on uninstall.
+    preexisting = ch_.manifest.setdefault("preexisting", [])
     for name in sorted(os.listdir(src_root)):
         src = os.path.join(src_root, name)
         if not os.path.isdir(src):
             continue
         dst = os.path.join(agents_skills, name)
-        for root, _, files in os.walk(src):
-            for fn in files:
-                s = os.path.join(root, fn)
-                t = os.path.join(dst, os.path.relpath(s, src))
-                new = read_text(s)
-                old = read_text(t)
-                if old == new:
-                    continue
-                if old is None:
-                    ch_.manifest["created"].append(t)
-                    ch_.manifest.setdefault("hashes", {})[t] = hashlib.sha256(
-                        new.encode("utf-8")).hexdigest()
-                else:
-                    shutil.copy2(t, "%s.agentloop-bak-%s" % (t, ch_.stamp))
-                os.makedirs(os.path.dirname(t), exist_ok=True)
-                shutil.copy2(s, t)
-                ch_.log.append("installed skill file " + t)
         link = os.path.join(claude_skills, name)
+        bundled = {os.path.join(dst, os.path.relpath(os.path.join(r, f), src)): os.path.join(r, f)
+                   for r, _, fs in os.walk(src) for f in fs}
+        if os.path.islink(dst) or through_link(env, dst):
+            ch_.log.append("left %s alone: it is reached through a symlink" % dst)
+            continue
+        mine = [os.path.join(r, f) for r, _, fs in os.walk(dst) for f in fs] if os.path.isdir(dst) else []
+        recorded = any(p.startswith(dst + os.sep) for p in created + preexisting)
+        if os.path.lexists(dst) and not recorded:
+            # Not recorded as agentloop's. Take it over only if it is exactly the bundled copy
+            # (an earlier install, or a lost manifest): nothing of the user's can be lost then.
+            if not (os.path.isdir(dst) and set(mine) == set(bundled) and all(
+                    not os.path.islink(p) and skill_text(p) == read_text(bundled[p]) for p in mine)):
+                ch_.log.append("left %s alone: a skill with that name exists and agentloop did "
+                               "not create it" % dst)
+                continue
+            preexisting.extend(p for p in mine if p not in preexisting)
+            ch_.log.append("now keeping %s in sync: it matches the bundled copy exactly" % dst)
+        for p in mine:  # files an earlier version installed that are no longer bundled
+            if p in created and p not in bundled and not os.path.islink(p) and \
+                    not through_link(env, p) and unchanged(p, hashes.get(p)):
+                os.unlink(p)
+                created.remove(p)
+                hashes.pop(p, None)
+                ch_.log.append("removed old skill file " + p)
+        for t, s in sorted(bundled.items()):
+            if os.path.islink(t) or through_link(env, t):
+                ch_.log.append("left %s alone: it is or is reached through a symlink" % t)
+                continue
+            new, old = read_text(s), skill_text(t)
+            if old == new:
+                continue
+            if old is not None:
+                shutil.copy2(t, "%s.agentloop-bak-%s" % (t, ch_.stamp))
+            elif t not in preexisting and t not in created:
+                created.append(t)  # a taken-over file the user deleted stays theirs
+            if t in created:
+                hashes[t] = sha256(new)
+            os.makedirs(os.path.dirname(t), exist_ok=True)
+            shutil.copy2(s, t)
+            ch_.log.append("installed skill file " + t)
         if os.path.lexists(link):
             if not (os.path.islink(link) and os.path.realpath(link) == os.path.realpath(dst)):
                 ch_.log.append("left existing %s unchanged" % link)
             continue
+        if os.path.islink(claude_skills):
+            ch_.log.append("left %s alone: it is a symlink" % claude_skills)
+            continue
         os.makedirs(claude_skills, exist_ok=True)
         os.symlink(dst, link)
-        ch_.manifest["created"].append(link)
+        created.append(link)
         ch_.log.append("linked %s -> %s" % (link, dst))
 
 
@@ -378,10 +443,23 @@ def uninstall(env):
         text = read_text(path)
         if text and MARK_BEGIN in text:
             finish(path, remove_block(text))
+    agents_skills = os.path.join(home(env), ".agents", "skills")
+    claude_skills = os.path.join(claude_dir(env), "skills")
     for path in reversed(m["created"]):
         want = m.get("hashes", {}).get(path)
+        skill = path.startswith((agents_skills + os.sep, claude_skills + os.sep))
+        if os.path.islink(path) and want:
+            done.append("kept %s: it was replaced by a symlink" % path)
+            continue
+        if os.path.islink(path) and os.path.dirname(path) == claude_skills and \
+                os.readlink(path) != os.path.join(agents_skills, os.path.basename(path)):
+            done.append("kept %s: it now points somewhere else" % path)
+            continue
+        if skill and not os.path.islink(path) and through_link(env, path):
+            done.append("kept %s: it is reached through a symlinked folder" % path)
+            continue
         if want and os.path.isfile(path) and not os.path.islink(path):
-            if hashlib.sha256((read_text(path) or "").encode("utf-8")).hexdigest() != want:
+            if not unchanged(path, want):
                 done.append("kept edited " + path)
                 continue
         if os.path.islink(path) or os.path.isfile(path):
