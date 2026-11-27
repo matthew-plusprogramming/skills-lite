@@ -386,13 +386,13 @@ class InstallTest(Base):
         self.assertIn("not valid JSON", err)
         self.assertEqual(before, tree_digest(self.home))
 
-    def test_differing_skill_is_backed_up(self):
+    def test_differing_same_name_skill_is_left_alone(self):
         self.write(".agents/skills/review-plan/SKILL.md", "local edit\n")
-        self.install()
+        _, out, _ = self.install()
         d = os.path.join(self.home, ".agents", "skills", "review-plan")
-        backups = [f for f in os.listdir(d) if ".agentloop-bak-" in f]
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(slurp(os.path.join(d, backups[0])), "local edit\n")
+        self.assertEqual(slurp(os.path.join(d, "SKILL.md")), "local edit\n")
+        self.assertEqual(os.listdir(d), ["SKILL.md"])  # no backup needed: nothing was replaced
+        self.assertIn("left %s alone" % d, out)
 
     def test_existing_claude_skill_entry_untouched(self):
         os.makedirs(os.path.join(self.home, ".claude", "skills", "review-plan"))
