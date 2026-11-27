@@ -18,8 +18,8 @@ select = [
   "UP004", "UP008", "UP010", "UP032",  # object base, super(C, self), __future__, .format
   "RUF006", "RUF100",                # dangling asyncio task, unused noqa
 ]
-# Not selected: whole "B" (B023 was 5/5 false in a trial); "B904" (2/2 noise on every
-# branch: the raise is UserError, which main() prints, so the chained traceback never shows);
+# Not selected: whole "B" (B023 was 5/5 false in a trial); "B904" (every hit noise: 2 here, 4 on
+# the split branches incl. 2 in the v1 fixture; each raise is UserError, printed by main());
 # "BLE001"/"S110" (agentloop's fail-open catches are deliberate); "T20" (print is the CLI's
 # output); "ERA001" (heuristic). Ruff checks syntax against py38 but not runtime APIs
 # (e.g. dict | dict), so running the tests on 3.8 is what guards the minimum.
