@@ -149,19 +149,49 @@ def toml_features_hooks(text):
     return None
 
 
+def _toml_code(text):
+    """TOML text without comments, with each multi-line string collapsed to an empty one so
+    its contents cannot look like keys. One-line strings are kept (keys may be quoted)."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith(c * 3, i) and c in "\"'":
+            j = i + 3
+            while True:
+                k = text.find(c * 3, j)
+                if k < 0:
+                    k = n
+                    break
+                slashes = len(text[j:k]) - len(text[j:k].rstrip("\\"))
+                if c == '"' and slashes % 2:  # \""" : the first quote is escaped
+                    j = k + 1
+                    continue
+                break
+            end = min(n, k + 3)
+            while end < n and end < k + 5 and text[end] == c:  # """" or """"" closers
+                end += 1
+            out.append(c * 2)
+            i = end
+        elif c in "\"'":
+            j = i + 1
+            while j < n and text[j] not in (c, "\n"):
+                j += 2 if c == '"' and text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _toml_features_lines(text):
     """Boolean keys under `features` for the spellings above, without a TOML parser."""
-    out, section, in_str = {}, "", None
-    for line in text.splitlines():
-        if in_str:  # inside a multi-line string: nothing here is a key
-            if line.count(in_str) % 2:
-                in_str = None
-            continue
-        quote = next((q for q in ('"""', "'''") if line.count(q) % 2), None)
-        if quote:
-            in_str = quote
-            continue
-        s = line.split("#", 1)[0].strip()
+    out, section = {}, ""
+    for line in _toml_code(text).splitlines():
+        s = line.strip()
         if s.startswith("["):
             section = re.sub(r"[\s\"']", "", s.strip("[]"))
             continue

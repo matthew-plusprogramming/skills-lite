@@ -460,7 +460,14 @@ class InstallTest(Base):
                  ("[profiles.p.features]\nhooks = false\n", None),
                  ("[features]\nhooks\t= false\n", False), ("features\t.\thooks = false\n", False),
                  ('note = """\n[features]\nhooks = false\n"""\n', None),
-                 ("note = '''\nfeatures.hooks = false\n'''\n[features]\nhooks = true\n", True))
+                 ("note = '''\nfeatures.hooks = false\n'''\n[features]\nhooks = true\n", True),
+                 # quote runs that are not multi-line strings must not hide what follows
+                 ('# example: x = """\n[features]\nhooks = false\n', False),
+                 ('model = "m" # """\nfeatures.hooks = false\n', False),
+                 ("x = 'has \"\"\" inside'\nfeatures.hooks = false\n", False),
+                 ("x = '''a \"\"\" b'''\nfeatures.hooks = false\n", False),
+                 ('x = """a""" # """\nfeatures.hooks = false\n', False),
+                 ('x = """a \\""" b"""\nfeatures.hooks = false\n', False))
 
     def test_features_hooks_spellings(self):
         for text, want in self.SPELLINGS:
