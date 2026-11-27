@@ -326,7 +326,7 @@ class InstallTest(Base):
         self.assertEqual(after1[".agents/skills/review-plan/SKILL.md"],
                          before[".agents/skills/review-plan/SKILL.md"])
         binp = os.path.join(self.home, ".local", "bin", "agentloop")
-        self.assertTrue(slurp(binp).startswith("#!/usr/bin/env-python -IS\n"))
+        self.assertTrue(slurp(binp).startswith("#!/usr/bin/env-python -sS\n"))
         self.assertTrue(os.access(binp, os.X_OK))
         self.assertIn('export PATH="$HOME/.local/bin:$PATH"', out)
 

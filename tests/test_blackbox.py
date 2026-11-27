@@ -253,7 +253,7 @@ class HotPathTest(BlackBox):
         env = dict(self.base_env, CLAUDE_PID="50", CLAUDE_CODE_SESSION_ID="m1",
                    AGENTLOOP_TEST_PROCTREE=json.dumps(CLAUDE_TREE))
         for argv in ("hook claude", "plan x", "status"):
-            r = subprocess.run([sys.executable, "-IS", "-c", probe, argv, payload],
+            r = subprocess.run([sys.executable, "-sS", "-c", probe, argv, payload],
                                capture_output=True, text=True, env=env)
             loaded = set(json.loads(r.stderr.strip().splitlines()[-1]))
             self.assertEqual(loaded & self.BANNED, set(), argv)
