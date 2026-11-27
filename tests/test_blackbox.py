@@ -5,6 +5,7 @@ be restructured or reimplemented safely.
 Run: python3 -m unittest discover -s tests
 Point the suite at another build with AGENTLOOP_UNDER_TEST='["/path/to/agentloop"]'.
 """
+import hashlib
 import json
 import os
 import shutil
@@ -20,6 +21,33 @@ CMD = json.loads(os.environ["AGENTLOOP_UNDER_TEST"]) if os.environ.get("AGENTLOO
 
 CLAUDE_TREE = [[100, "zsh", ["zsh"]], [50, "claude", ["claude"]]]
 CODEX_TREE = [[100, "zsh", ["zsh"]], [70, "codex", ["codex"]]]
+
+
+# The released single-file agentloop, read from git history for the compatibility tests rather
+# than vendored. Shallow clones (CI checkouts) fetch just this commit; without it the tests fail.
+V1_COMMIT = "dfffe92a9a4544549037252efa28d833ec505b58"
+V1_SHA256 = "dcb340f90a75f3deae8a36c372ffdd80f26bc0cbbab9a9b923b6a2c481b87e65"
+_v1 = {}
+
+
+def v1_script():
+    if "path" not in _v1:
+        def show():
+            return subprocess.run(["git", "-C", ROOT, "show", V1_COMMIT + ":bin/agentloop"],
+                                  capture_output=True)
+        r = show()
+        if r.returncode:
+            subprocess.run(["git", "-C", ROOT, "fetch", "-q", "--depth", "1", "origin", V1_COMMIT],
+                           capture_output=True)
+            r = show()
+        if r.returncode or hashlib.sha256(r.stdout).hexdigest() != V1_SHA256:
+            raise RuntimeError("released agentloop %s not available from git: %s"
+                               % (V1_COMMIT[:7], r.stderr.decode(errors="replace").strip()))
+        d = tempfile.mkdtemp(prefix="agentloop-v1-")
+        _v1["path"] = os.path.join(d, "agentloop-v1.py")
+        with open(_v1["path"], "wb") as f:
+            f.write(r.stdout)
+    return _v1["path"]
 
 
 def slurp(path):
@@ -208,17 +236,17 @@ class HookTest(BlackBox):
 
 class HotPathTest(BlackBox):
     """Keep the Stop hook lean: these modules cost ~2-5 ms each and the hook never needs them."""
-    BANNED = {"subprocess", "shutil", "hashlib", "tempfile", "agentloop.install"}
+    BANNED = {"subprocess", "shutil", "hashlib", "tempfile", "install"}
 
     def test_hook_and_record_paths_import_nothing_heavy(self):
         probe = (
             "import io, json, sys\n"
             "sys.path.insert(0, %r)\n"
-            "from agentloop.runtime import main\n"
+            "from agentloop import main\n"
             "sys.stdin = io.StringIO(sys.argv[2])\n"
             "sys.stdout = io.StringIO()\n"
             "main(sys.argv[1].split())\n"
-            "sys.stderr.write(json.dumps(sorted(sys.modules)))\n" % ROOT)
+            "sys.stderr.write(json.dumps(sorted(sys.modules)))\n" % os.path.join(ROOT, "agentloop"))
         payload = json.dumps({"session_id": "m1", "prompt_id": "p1", "hook_event_name": "Stop"})
         env = dict(self.base_env, CLAUDE_PID="50", CLAUDE_CODE_SESSION_ID="m1",
                    AGENTLOOP_TEST_PROCTREE=json.dumps(CLAUDE_TREE))
@@ -321,7 +349,7 @@ class InstallTest(BlackBox):
     def run_v1(self, *argv):
         """The released single-file agentloop (main at dfffe92), for compatibility tests."""
         e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
-        return subprocess.run([sys.executable, os.path.join(ROOT, "tests", "fixtures", "agentloop-v1.py")]
+        return subprocess.run([sys.executable, v1_script()]
                               + list(argv), capture_output=True, text=True, env=e)
 
     def lib(self, *parts):
@@ -359,9 +387,9 @@ class InstallTest(BlackBox):
         binp = os.path.join(self.home, ".local", "bin", "agentloop")
         e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
         payload = json.dumps({"session_id": "f1", "prompt_id": "p1", "hook_event_name": "Stop"})
-        runtime = self.lib("agentloop", "runtime.py")
+        runtime = self.lib("agentloop.py")
         text = slurp(runtime)
-        shutil.rmtree(self.lib("agentloop", "__pycache__"))
+        shutil.rmtree(self.lib("__pycache__"))
         with open(runtime, "w") as f:
             f.write(text.replace('VERSION = "', 'VERSION = "old-'))
         for state in ("version mismatch", "module missing"):
