@@ -3,6 +3,7 @@
 #   uvx ruff@0.17.6 check --exit-zero --statistics
 target-version = "py38"
 extend-include = ["bin/agentloop"]   # extensionless script; Ruff skips it otherwise
+extend-exclude = ["tests/fixtures"]  # frozen copy of the released version
 
 [lint]
 select = [

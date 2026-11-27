@@ -294,6 +294,62 @@ class InstallTest(BlackBox):
         self.assertEqual(r.returncode, 2)
         self.assertIn("is not agentloop", r.stderr)
 
+    def run_v1(self, *argv):
+        """The released single-file agentloop (main at dfffe92), for compatibility tests."""
+        e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
+        return subprocess.run([sys.executable, os.path.join(ROOT, "tests", "fixtures", "agentloop-v1.py")]
+                              + list(argv), capture_output=True, text=True, env=e)
+
+    def lib(self, *parts):
+        return os.path.join(self.home, ".local", "share", "agentloop", *parts)
+
+    def test_upgrade_from_v1_then_uninstall_restores_bytes(self):
+        self.seed()
+        r = self.run_v1("install", "--python", "/usr/bin/env-python", "--source", ROOT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        binp = os.path.join(self.home, ".local", "bin", "agentloop")
+        self.assertIn("agentloop launcher", slurp(binp))
+        self.assertEqual(len(json.loads(self.read(".claude/settings.json"))["hooks"]["Stop"]), 1)
+        r = self.run_al("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for rel, text in self.files.items():
+            self.assertEqual(self.read(rel), text, rel)
+        self.assertFalse(os.path.exists(binp))
+        self.assertFalse(os.path.exists(self.lib()))
+
+    def test_v1_uninstall_over_new_install(self):
+        self.seed()
+        self.assertEqual(self.install().returncode, 0)
+        r = self.run_v1("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for rel, text in self.files.items():
+            self.assertEqual(self.read(rel), text, rel)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "agentloop")))
+        leftovers = [os.path.join(d, f) for d, _, fs in os.walk(self.lib()) for f in fs]
+        self.assertEqual(leftovers, [])  # the old uninstall leaves only empty directories
+
+    def test_launcher_fails_open_when_modules_missing_or_mismatched(self):
+        self.assertEqual(self.install(python=sys.executable).returncode, 0)
+        binp = os.path.join(self.home, ".local", "bin", "agentloop")
+        e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
+        payload = json.dumps({"session_id": "f1", "prompt_id": "p1", "hook_event_name": "Stop"})
+        runtime = self.lib("agentloop", "runtime.py")
+        text = slurp(runtime)
+        shutil.rmtree(self.lib("agentloop", "__pycache__"))
+        with open(runtime, "w") as f:
+            f.write(text.replace('VERSION = "', 'VERSION = "old-'))
+        for state in ("version mismatch", "module missing"):
+            if state == "module missing":
+                os.unlink(runtime)
+            h = subprocess.run([binp, "hook", "claude"], input=payload, capture_output=True, text=True, env=e)
+            self.assertEqual((h.returncode, h.stdout), (0, ""))
+            st = subprocess.run([binp, "status"], capture_output=True, text=True, env=e)
+            self.assertEqual(st.returncode, 2)
+            self.assertIn("installation is incomplete", st.stderr, state)
+        self.assertIn("launcher:", self.read(".local/state/agentloop/log"))
+
     def test_install_sh_round_trip(self):
         e = dict(self.base_env, AGENTLOOP_TEST_PROCTREE="[]")
         r = subprocess.run(["sh", os.path.join(ROOT, "install.sh")], capture_output=True, text=True, env=e)
