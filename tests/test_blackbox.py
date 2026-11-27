@@ -9,6 +9,7 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -228,6 +229,23 @@ class HookTest(BlackBox):
         log = slurp(os.path.join(self.home, ".local", "state", "agentloop", "log"))
         self.assertIn("error", log)
 
+    def test_normal_turns_log_no_errors(self):
+        # The hook fails open, so a crash looks like "allow"; the log is where it shows.
+        self.assertIsNotNone(self.stop("claude", "n1", "t0"))
+        for i, step in enumerate((["plan", "x"], ["wait"], ["reviewed"], ["approved"],
+                                  ["verified", "ok"], ["exempt"])):
+            self.assertEqual(self.claude(*step, sid="n1").returncode, 0, step)
+            self.stop("claude", "n1", "t%d" % (i + 1))
+            self.stop("claude", "n1", "t%d" % (i + 1), stop_hook_active=True)
+        self.codex("plan", "x", sid="n2")
+        self.stop("codex", "n2", "u1")
+        self.stop("claude", "n3", "t1", background_tasks=[{"id": "b"}])
+        self.stop("claude", "n4", "t1", env={"AGENTLOOP": "off"})
+        recs = [json.loads(line) for line in
+                slurp(os.path.join(self.home, ".local", "state", "agentloop", "log")).splitlines()]
+        self.assertEqual(len(recs), 16)  # one record per hook call above
+        self.assertEqual([r for r in recs if "error" in r], [])
+
     def test_non_stop_event_and_unknown_agent_ignored(self):
         r = self.run_al("hook", "claude", stdin=json.dumps({"hook_event_name": "SessionStart",
                                                               "session_id": "s", "prompt_id": "p"}))
@@ -423,6 +441,46 @@ class InstallTest(BlackBox):
                            capture_output=True, text=True, env=e)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "agentloop")))
+
+
+class StatusTest(BlackBox):
+    """`agentloop status` reports each hook problem a user can fix, and says ok otherwise."""
+    def write(self, rel, text, mode="w"):
+        p = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, mode, encoding="utf-8") as f:
+            f.write(text)
+
+    def hooks(self):
+        r = self.claude("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return dict(re.findall(r"^hook (\w+):\s+(.*)$", r.stdout, re.M))
+
+    def test_each_warning_and_ok(self):
+        log = os.path.join(self.home, ".local", "state", "agentloop", "log")
+        h = self.hooks()
+        for agent in ("claude", "codex"):
+            self.assertIn("Stop hook not configured (run install.sh)", h[agent])
+            self.assertIn("binary missing at " + os.path.join(self.home, ".local", "bin", "agentloop"), h[agent])
+        r = self.run_al("install", "--python", "/usr/bin/env-python", "--source", ROOT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        h = self.hooks()
+        self.assertEqual(h["claude"], "ok")
+        self.assertEqual(h["codex"], "hook not trusted yet: open codex and choose 'Trust all and continue'")
+        # Codex's trust record for the first Stop group (Codex's own key format).
+        self.write(".codex/config.toml", '[hooks.state."%s:stop:0:0"]\ntrusted_hash = "sha256:11"\n'
+                   % os.path.join(self.home, ".codex", "hooks.json"), "a")
+        self.assertEqual(self.hooks(), {"claude": "ok", "codex": "ok"})
+        trusted = slurp(os.path.join(self.home, ".codex", "config.toml"))
+        for off in ("[features]\nhooks = false\n", "features.codex_hooks = false\n"):
+            self.write(".codex/config.toml", off + trusted)  # top-level keys go before tables
+            self.assertEqual(self.hooks()["codex"], "hooks are turned off in config.toml [features]; "
+                             "remove that setting to let the Stop hook run", off)
+        self.write(".codex/config.toml", "[features]\nhooks = true\n" + trusted)
+        self.assertEqual(self.hooks()["codex"], "ok")
+        self.run_al("hook", "claude", stdin="[]")  # a hook crash is logged, not shown
+        self.assertEqual(self.hooks(), {a: "1 hook error(s) in the last day (see %s)" % log
+                                        for a in ("claude", "codex")})
 
 
 if __name__ == "__main__":
