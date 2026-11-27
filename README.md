@@ -10,7 +10,7 @@ cd skills-lite
 ./install.sh
 ```
 
-The installer is safe to re-run. It backs up every file before changing it, keeps your existing settings, and stops without writing anything if a settings file does not parse. If `~/.local/bin` is not on your `PATH`, it prints the line to add.
+The installer is safe to re-run. Before it first changes a file it saves the original under `~/.local/state/agentloop/originals`, keeps your existing settings, and stops without writing anything if a settings file does not parse. If `~/.local/bin` is not on your `PATH`, it prints the line to add.
 
 Codex runs a new hook only after you trust it: open `codex` once (in an empty folder) and choose **Trust all and continue**.
 
@@ -18,10 +18,10 @@ Codex runs a new hook only after you trust it: open `codex` once (in an empty fo
 
 The installer works user-wide, for Claude Code and Codex:
 
-- Installs the `agentloop` CLI to `~/.local/bin/agentloop`.
+- Installs the `agentloop` CLI to `~/.local/bin/agentloop`, a small launcher for the code in `~/.local/share/agentloop`.
 - Adds one `Stop` hook to `~/.claude/settings.json` and one to `~/.codex/hooks.json`, and sets `features.hooks = true` in `~/.codex/config.toml`. Hooks are enabled on install.
 - Installs the full work loop from the repository’s `AGENTS.md` into a marked section of `~/.codex/AGENTS.md`. Claude imports that file from `~/.claude/CLAUDE.md`. Re-running the installer upgrades the previous reminder and preserves personal instructions outside the marked section.
-- Copies `skills/` into `~/.agents/skills`, backing up any file that differs, and links each skill into `~/.claude/skills` where no entry exists yet.
+- Copies `skills/` into `~/.agents/skills` (saving the original of any file that differs) and links each skill into `~/.claude/skills` where no entry exists yet.
 
 Lifecycle state is kept per session under `~/.local/state/agentloop`. The installer never changes sandbox or approval settings. In a sandboxed agent shell (for example Codex `workspace-write`) that folder may not be writable, so `agentloop` commands need your agent's approval to run outside the sandbox.
 
@@ -43,4 +43,4 @@ Run `agentloop` with no arguments for its commands. Headless runs (`claude -p`, 
 ./install.sh --uninstall
 ```
 
-This removes the CLI, both hooks, Codex's trust record for the hook, the guidance block and any skill files the installer created. Files are restored byte for byte when nothing else changed them.
+This removes the CLI and its code, both hooks, Codex's trust record for the hook, the guidance block and any skill files the installer created, and puts back skill files it replaced. Files are restored byte for byte when nothing else changed them; files you edited after installing are kept.

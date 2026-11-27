@@ -387,13 +387,24 @@ class InstallTest(Base):
         self.assertIn("not valid JSON", err)
         self.assertEqual(before, tree_digest(self.home))
 
-    def test_differing_skill_is_backed_up(self):
+    def test_differing_skill_is_restored_on_uninstall(self):
+        # One backup mechanism: originals/ (no .agentloop-bak files beside the user's files).
         self.write(".agents/skills/review-plan/SKILL.md", "local edit\n")
         self.install()
         d = os.path.join(self.home, ".agents", "skills", "review-plan")
-        backups = [f for f in os.listdir(d) if ".agentloop-bak-" in f]
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(slurp(os.path.join(d, backups[0])), "local edit\n")
+        self.assertEqual([f for f in os.listdir(d) if ".agentloop-bak-" in f], [])
+        self.assertNotEqual(slurp(os.path.join(d, "SKILL.md")), "local edit\n")
+        self.install()  # a re-install must not overwrite the saved original
+        _, out, _ = self.run_cli("uninstall")
+        self.assertEqual(slurp(os.path.join(d, "SKILL.md")), "local edit\n")
+        self.assertIn("restored", out)
+
+    def test_no_backup_files_left_beside_settings(self):
+        self.seed()
+        self.install()
+        self.run_cli("uninstall")
+        litter = [os.path.join(r, f) for r, _, fs in os.walk(self.home) for f in fs if ".agentloop-bak-" in f]
+        self.assertEqual(litter, [])
 
     def test_existing_claude_skill_entry_untouched(self):
         os.makedirs(os.path.join(self.home, ".claude", "skills", "review-plan"))

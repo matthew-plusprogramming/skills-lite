@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import sys
-import time
 
 from agentloop.common import (MARK_BEGIN, MARK_END, HOOK_TIMEOUT, UserError, atomic_write,
                               bin_path, claude_dir, codex_dir, find_hook, hook_command, home,
@@ -158,8 +157,13 @@ def imports_agents(claude_md, env):
     return False
 
 
+def sha256(text):
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 class Changes:
-    """Track file edits with backups and a manifest for uninstall."""
+    """Track file edits and a manifest for uninstall. Before the first change to a file, its
+    original is copied to originals/; uninstall restores from there or removes only our edits."""
 
     def __init__(self, env):
         self.env = env
@@ -167,24 +171,20 @@ class Changes:
         self.manifest = json.loads(read_text(self.mpath) or "{}")
         self.manifest.setdefault("originals", {})
         self.manifest.setdefault("created", [])
-        self.stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         self.log = []
 
     def write(self, path, new, label):
         old = read_text(path)
         if old == new:
             return
-        orig_dir = os.path.join(state_dir(self.env), "originals")
         if path not in self.manifest["originals"]:
-            if old is None:
-                self.manifest["originals"][path] = None
-            else:
-                os.makedirs(orig_dir, exist_ok=True)
-                keep = os.path.join(orig_dir, hashlib.sha1(path.encode()).hexdigest()[:12])
+            keep = None
+            if old is not None:
+                keep = os.path.join(state_dir(self.env), "originals",
+                                    hashlib.sha1(path.encode()).hexdigest()[:12])
+                os.makedirs(os.path.dirname(keep), exist_ok=True)
                 shutil.copy2(path, keep)
-                self.manifest["originals"][path] = keep
-        if old is not None:
-            shutil.copy2(path, "%s.agentloop-bak-%s" % (path, self.stamp))
+            self.manifest["originals"][path] = keep
         atomic_write(path, new)
         self.log.append(label)
 
@@ -340,19 +340,13 @@ def install_skills(env, src_root, ch_):
             for fn in files:
                 s = os.path.join(root, fn)
                 t = os.path.join(dst, os.path.relpath(s, src))
-                new = read_text(s)
-                old = read_text(t)
+                new, old = read_text(s), read_text(t)
                 if old == new:
                     continue
-                if old is None:
+                if old is None and t not in ch_.manifest["created"]:
                     ch_.manifest["created"].append(t)
-                    ch_.manifest.setdefault("hashes", {})[t] = hashlib.sha256(
-                        new.encode("utf-8")).hexdigest()
-                else:
-                    shutil.copy2(t, "%s.agentloop-bak-%s" % (t, ch_.stamp))
-                os.makedirs(os.path.dirname(t), exist_ok=True)
-                shutil.copy2(s, t)
-                ch_.log.append("installed skill file " + t)
+                ch_.manifest.setdefault("hashes", {})[t] = sha256(new)  # to spot later edits
+                ch_.write(t, new, "installed skill file " + t)
         link = os.path.join(claude_skills, name)
         if os.path.lexists(link):
             if not (os.path.islink(link) and os.path.realpath(link) == os.path.realpath(dst)):
@@ -411,12 +405,21 @@ def uninstall(env):
         text = read_text(path)
         if text and MARK_BEGIN in text:
             finish(path, remove_block(text))
+    hashes = m.get("hashes", {})
+
+    def edited(path):
+        if hashes.get(path) and os.path.isfile(path) and sha256(read_text(path)) != hashes[path]:
+            done.append("kept edited " + path)
+            return True
+        return False
+
+    for path, keep in m["originals"].items():  # skill files we overwrote: put the original back
+        if keep and path in hashes and os.path.isfile(path) and not edited(path):
+            shutil.copy2(keep, path)
+            done.append("restored " + path)
     for path in reversed(m["created"]):
-        want = m.get("hashes", {}).get(path)
-        if want and os.path.isfile(path) and not os.path.islink(path):
-            if hashlib.sha256((read_text(path) or "").encode("utf-8")).hexdigest() != want:
-                done.append("kept edited " + path)
-                continue
+        if edited(path):
+            continue
         if os.path.islink(path) or os.path.isfile(path):
             os.unlink(path)
             done.append("removed " + path)
