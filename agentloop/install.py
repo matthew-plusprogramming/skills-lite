@@ -196,7 +196,9 @@ MODULES = ("__init__.py", "common.py", "runtime.py", "install.py")
 
 # ~/.local/bin/agentloop keeps its path (the Stop hooks call it); it only imports the modules.
 # It fails open: if the modules are missing or from another version, `hook` exits 0 silently.
-LAUNCHER = """#!%(python)s
+# -IS (one combined flag: Linux passes a single shebang argument) skips site-packages and
+# user environment variables; agentloop is stdlib-only.
+LAUNCHER = """#!%(python)s -IS
 # agentloop launcher, installed by skills-lite. Code: %(lib)s
 import sys
 sys.path.insert(0, %(lib)r)

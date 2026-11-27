@@ -1,9 +1,7 @@
 """Paths, file helpers and hook ownership checks shared by the runtime and the installer."""
 import json
 import os
-import re
-import shutil
-import tempfile
+import re  # json imports re anyway, so this costs nothing extra
 import time
 
 try:
@@ -52,14 +50,17 @@ def lib_dir(env):
 
 
 def atomic_write(path, data):
+    """Write via a temp file in the same directory and rename, keeping the file's mode.
+    Plain os calls: tempfile and shutil would add ~5 ms of imports to every Stop."""
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".agentloop-")
+    tmp = os.path.join(d, ".agentloop-%d-%s" % (os.getpid(), os.path.basename(path)))
     try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
         if os.path.exists(path):
-            shutil.copymode(path, tmp)
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):

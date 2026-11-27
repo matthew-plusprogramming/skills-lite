@@ -4,7 +4,6 @@ Kept lean: everything here runs on every Stop, so install-only code lives in age
 """
 import json
 import os
-import subprocess
 import sys
 import time
 
@@ -121,8 +120,13 @@ def _darwin_argv(pid):
 
 
 def _ps(pid, field):
-    out = subprocess.run(["ps", "-o", field + "=", "-p", str(pid)], capture_output=True,
-                         text=True, timeout=5).stdout.strip()
+    """Fallback when /proc and sysctl are unavailable; imported lazily (~4 ms) on that path only."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-o", field + "=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
     return out or None
 
 
@@ -167,7 +171,7 @@ def proc_info(pid, want_args=False):
                 except Exception:
                     argv = None
             args = argv if argv is not None else (_ps(pid, "args") or "").split()
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError):
         if info is None:
             return None
     return info[0], info[1], args
@@ -220,11 +224,12 @@ def current_session(env, start=None):
 
 
 def is_headless(agent, env, start=None):
+    if agent == "claude":
+        # `claude -p` and SDK runs set CLAUDE_CODE_ENTRYPOINT=sdk-* (checked on Claude Code
+        # 2.1.332), so no process walk is needed; that keeps ctypes off Claude's Stop path.
+        return env.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk")
     found = nearest_agent(env, start, want_args=True)
     args = found[2][1:] if found and found[0] == agent else []
-    if agent == "claude":
-        ep = env.get("CLAUDE_CODE_ENTRYPOINT", "")
-        return ep.startswith("sdk") or "-p" in args or "--print" in args
     return codex_subcommand(args) in ("exec", "e", "review")
 
 

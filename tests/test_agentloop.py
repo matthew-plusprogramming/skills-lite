@@ -140,8 +140,9 @@ class SessionLookupTest(unittest.TestCase):
         self.assertTrue(al.is_headless("codex", {}))
         self.with_tree([(7, "codex", ["codex", "-m", "exec"])])
         self.assertFalse(al.is_headless("codex", {}))
+        # Claude: the entrypoint decides; `claude -p` sets sdk-cli, so argv is not consulted.
         self.with_tree([(5, "claude", ["claude", "-p", "x"])])
-        self.assertTrue(al.is_headless("claude", {"CLAUDE_PID": "5", "CLAUDE_CODE_ENTRYPOINT": "cli"}))
+        self.assertFalse(al.is_headless("claude", {"CLAUDE_PID": "5", "CLAUDE_CODE_ENTRYPOINT": "cli"}))
         self.with_tree([(5, "claude", ["claude"])])
         self.assertTrue(al.is_headless("claude", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}))
         self.assertFalse(al.is_headless("claude", {"CLAUDE_PID": "5", "CLAUDE_CODE_ENTRYPOINT": "cli"}))
@@ -325,7 +326,7 @@ class InstallTest(Base):
         self.assertEqual(after1[".agents/skills/review-plan/SKILL.md"],
                          before[".agents/skills/review-plan/SKILL.md"])
         binp = os.path.join(self.home, ".local", "bin", "agentloop")
-        self.assertTrue(slurp(binp).startswith("#!/usr/bin/env-python\n"))
+        self.assertTrue(slurp(binp).startswith("#!/usr/bin/env-python -IS\n"))
         self.assertTrue(os.access(binp, os.X_OK))
         self.assertIn('export PATH="$HOME/.local/bin:$PATH"', out)
 
